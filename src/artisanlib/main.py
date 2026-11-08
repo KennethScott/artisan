@@ -1430,7 +1430,7 @@ class ApplicationWindow(QMainWindow):
         'recentThemeActs', 'applicationDirectory', 'helpdialog', 'redrawTimer', 'lastLoadedProfile', 'lastLoadedBackground', 'LargeScaleLCDsFlag', 'largeScaleLCDs_dialog',
         'analysisresultsanno', 'segmentresultsanno', 'schedule_window', 'scheduleFlag', 'scheduled_items_uuids', 'largeLCDs_dialog', 'LargeLCDsFlag', 'largeDeltaLCDs_dialog', 'LargeDeltaLCDsFlag', 'largePIDLCDs_dialog',
         'LargePIDLCDsFlag', 'largeExtraLCDs_dialog', 'LargeExtraLCDsFlag', 'largePhasesLCDs_dialog', 'LargePhasesLCDsFlag', 'WebLCDs', 'WebLCDsPort', 'weblcds_server',
-        'WebAPIActive', 'WebAPIPort', 'WebAPIToken', 'WebAPIMinInterval', 'WebAPIMaxStep', 'WebAPIWatchdogTimeout', 'WebAPIWatchdogSlider', 'WebAPIWatchdogValue', 'webapi_server',
+        'WebAPIActive', 'WebAPIPort', 'WebAPIToken', 'WebAPIMinInterval', 'WebAPIMaxStep', 'WebAPIMaxSVStep', 'WebAPIWatchdogTimeout', 'WebAPIWatchdogSlider', 'WebAPIWatchdogValue', 'WebAPIWatchdogPIDOff', 'webapi_server',
         'weblcds_index_path', 'weblcds_websocket_path',
         'taskWebDisplayGreenActive', 'taskWebDisplayGreenPort', 'taskWebDisplayRoastedActive', 'taskWebDisplayRoastedPort',
         'taskWebDisplayGreen_server', 'taskWebDisplayRoasted_server',
@@ -1633,9 +1633,11 @@ class ApplicationWindow(QMainWindow):
         self.WebAPIToken:str = ''
         self.WebAPIMinInterval:float = 1.0
         self.WebAPIMaxStep:int = 0
+        self.WebAPIMaxSVStep:float = 0.0
         self.WebAPIWatchdogTimeout:float = 0.0
         self.WebAPIWatchdogSlider:int = -1
         self.WebAPIWatchdogValue:int = 0
+        self.WebAPIWatchdogPIDOff:bool = False
 
         # Tasks Web Displays
         self.taskWebDisplayGreenActive:bool = False
@@ -19491,9 +19493,11 @@ class ApplicationWindow(QMainWindow):
             self.WebAPIToken = toString(settings.value('token',self.WebAPIToken))
             self.WebAPIMinInterval = toFloat(settings.value('minInterval',self.WebAPIMinInterval))
             self.WebAPIMaxStep = toInt(settings.value('maxStep',self.WebAPIMaxStep))
+            self.WebAPIMaxSVStep = toFloat(settings.value('maxSVStep',self.WebAPIMaxSVStep))
             self.WebAPIWatchdogTimeout = toFloat(settings.value('watchdogTimeout',self.WebAPIWatchdogTimeout))
             self.WebAPIWatchdogSlider = toInt(settings.value('watchdogSlider',self.WebAPIWatchdogSlider))
             self.WebAPIWatchdogValue = toInt(settings.value('watchdogValue',self.WebAPIWatchdogValue))
+            self.WebAPIWatchdogPIDOff = toBool(settings.value('watchdogPIDOff',self.WebAPIWatchdogPIDOff))
             settings.endGroup()
 #--- END GROUP WebAPI
 
@@ -19925,9 +19929,11 @@ class ApplicationWindow(QMainWindow):
                     token=self.WebAPIToken,
                     min_interval=self.WebAPIMinInterval,
                     max_step=self.WebAPIMaxStep,
+                    max_sv_step=self.WebAPIMaxSVStep,
                     watchdog_timeout=self.WebAPIWatchdogTimeout,
                     watchdog_slider=self.WebAPIWatchdogSlider,
-                    watchdog_value=self.WebAPIWatchdogValue))
+                    watchdog_value=self.WebAPIWatchdogValue,
+                    watchdog_pid_off=self.WebAPIWatchdogPIDOff))
                 if self.webapi_server.start():
                     self.WebAPIActive = True
                     return True
@@ -21288,9 +21294,11 @@ class ApplicationWindow(QMainWindow):
             self.settingsSetValue(settings, default_settings, 'token',self.WebAPIToken, read_defaults)
             self.settingsSetValue(settings, default_settings, 'minInterval',self.WebAPIMinInterval, read_defaults)
             self.settingsSetValue(settings, default_settings, 'maxStep',self.WebAPIMaxStep, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'maxSVStep',self.WebAPIMaxSVStep, read_defaults)
             self.settingsSetValue(settings, default_settings, 'watchdogTimeout',self.WebAPIWatchdogTimeout, read_defaults)
             self.settingsSetValue(settings, default_settings, 'watchdogSlider',self.WebAPIWatchdogSlider, read_defaults)
             self.settingsSetValue(settings, default_settings, 'watchdogValue',self.WebAPIWatchdogValue, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'watchdogPIDOff',self.WebAPIWatchdogPIDOff, read_defaults)
             settings.endGroup()
 #--- END GROUP WebAPI
 

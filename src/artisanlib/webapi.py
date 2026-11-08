@@ -18,28 +18,39 @@
 
 """Local HTTP control API.
 
-Exposes a small JSON API that lets a local client read the current roast state
-and move the four event sliders / mark roast events, exactly as if the user had
-done it in the UI. All writes are routed through existing queued Qt signals so
-they execute in the GUI thread and fire the sliders' configured actions
-(e.g. Kaleido, MODBUS, Hottop, ...), making the API device-agnostic.
+Exposes a small JSON API that lets a local client read the current roast state,
+move the four event sliders, drive Artisan's PID (on/off and set value) and mark
+roast events, exactly as if the user had done it in the UI. All writes are routed
+through existing queued Qt signals so they execute in the GUI thread and fire the
+configured actions (e.g. Kaleido, MODBUS, Hottop, ...), making the API device-agnostic.
+
+Two levels of control:
+  * actuators: the event sliders (heat, fan, drum, ...)
+  * setpoint: Artisan's PID layer, which forwards the SV to a hardware PID (MODBUS,
+    S7, TC4, Kaleido) or runs Artisan's software PID on a slider. This suits a client
+    with seconds of latency: the PID closes the fast loop, the client moves the target.
 
 Endpoints (all JSON):
   GET  /api/v1/state                         current snapshot
   GET  /api/v1/wait?timeout=30&until=event   long-poll; returns on event, next sample or timeout
   POST /api/v1/slider   {"slider": 0..3, "value": n}
+  POST /api/v1/sv       {"value": n}          PID set value (manual SV mode only)
+  POST /api/v1/pid      {"on": true|false}    PID on/off ("off" is always accepted)
   POST /api/v1/event    {"event": "CHARGE"|"DRY"|"FCs"|"FCe"|"SCs"|"SCe"|"DROP"|"COOL"}
   POST /api/v1/release  clears a manual-override or watchdog lock
 
 Safety:
   * binds to 127.0.0.1 by default
   * optional bearer token
-  * slider values clamped to the configured slider min/max
-  * per-slider minimum interval between writes and optional maximum step size
-  * manual override: if a slider is moved by anything other than the API, writes
-    are refused until /release is called
+  * slider values clamped to the slider min/max and snapped to the slider step size;
+    SV clamped to the PID's SV slider min/max
+  * minimum interval between writes (per slider, SV, PID) and optional maximum step sizes
+  * manual override: if a slider, the SV or the PID state is changed by anything other
+    than the API (the user, a quantifier following the machine, a ramp/soak program),
+    writes are refused until /release is called
   * watchdog: if armed and no request arrives within the timeout, an optional
-    fallback slider value is applied and writes are locked until /release
+    fallback slider value is applied, optionally the PID is switched off, and writes
+    are locked until /release
 """
 
 import math
@@ -64,6 +75,8 @@ API_VERSION: Final[int] = 1
 EVENT_NAMES: Final[tuple[str, ...]] = ('CHARGE', 'DRY', 'FCs', 'FCe', 'SCs', 'SCe', 'DROP', 'COOL')
 MAX_WAIT_TIMEOUT: Final[float] = 120.0
 MANUAL_OVERRIDE_GRACE: Final[float] = 3.0 # seconds to wait for a queued slider move to land before comparing
+SV_TOLERANCE: Final[float] = 0.5 # SV differences below this are not considered an external change
+SV_MODES: Final[tuple[str, ...]] = ('manual', 'ramp_soak', 'background')
 
 
 class ArtisanAdapter(Protocol):
@@ -74,7 +87,12 @@ class ArtisanAdapter(Protocol):
     def slider_count(self) -> int: ...
     def slider_value(self, n:int) -> int: ...
     def slider_limits(self, n:int) -> tuple[int, int]: ...
+    def slider_step(self, n:int) -> int: ...
+    def slider_tolerance(self, n:int) -> int: ...
     def set_slider(self, n:int, value:int) -> None: ...
+    def pid_info(self) -> dict[str, Any]: ...
+    def set_sv(self, value:float) -> None: ...
+    def set_pid(self, on:bool) -> None: ...
     def is_recording(self) -> bool: ...
     def mark_event(self, name:str) -> None: ...
 
@@ -85,16 +103,22 @@ class WebAPIConfig:
     port: int = 8081
     token: str = ''                 # empty: no auth
     min_interval: float = 1.0       # minimum seconds between writes to the same slider (0: off)
-    max_step: int = 0               # maximum change per write (0: unlimited)
+    max_step: int = 0               # maximum slider change per write (0: unlimited)
+    max_sv_step: float = 0.0        # maximum SV change per write, in temperature units (0: unlimited)
     watchdog_timeout: float = 0.0   # seconds without any request before the watchdog trips (0: off)
     watchdog_slider: int = -1       # slider to set on trip (-1: just hold and lock)
     watchdog_value: int = 0         # value applied to watchdog_slider on trip
+    watchdog_pid_off: bool = False  # switch the PID off on trip
 
 
 @dataclass
 class ControlState:
     expected: dict[int, int] = field(default_factory=dict) # last value set via the API per slider
     last_write: dict[int, float] = field(default_factory=dict) # time of last write per slider
+    expected_sv: float|None = None  # last SV set via the API
+    last_sv_write: float|None = None
+    expected_pid: bool|None = None  # last PID state set via the API
+    last_pid_write: float|None = None
     override: bool = False
     override_reason: str = ''
     watchdog_armed: bool = False
@@ -125,6 +149,8 @@ class WebAPI:
             web.get('/api/v1/state', self.handle_state),
             web.get('/api/v1/wait', self.handle_wait),
             web.post('/api/v1/slider', self.handle_slider),
+            web.post('/api/v1/sv', self.handle_sv),
+            web.post('/api/v1/pid', self.handle_pid),
             web.post('/api/v1/event', self.handle_event),
             web.post('/api/v1/release', self.handle_release),
         ])
@@ -185,20 +211,54 @@ class WebAPI:
         return state
 
     def _check_manual_override(self) -> None:
-        """Engage the override if a slider the API set has since been moved by something else."""
+        """Engage the override if a slider, the SV or the PID state the API set has since
+        been changed by something else (user, quantifier following the machine, ramp/soak)."""
         now = time.monotonic()
         with self._lock:
-            if self._control.override:
+            c = self._control
+            if c.override:
                 return
-            for n, expected in self._control.expected.items():
-                if now - self._control.last_write.get(n, 0.0) < MANUAL_OVERRIDE_GRACE:
+            reason = ''
+            for n, expected in c.expected.items():
+                if now - c.last_write.get(n, 0.0) < MANUAL_OVERRIDE_GRACE:
                     continue
                 actual = self._adapter.slider_value(n)
-                if actual != expected:
-                    self._control.override = True
-                    self._control.override_reason = f'slider {n} moved externally ({expected} -> {actual})'
-                    _log.info('WebAPI manual override: %s', self._control.override_reason)
-                    return
+                # a quantifier rounds machine readings to its step; smaller differences are not a takeover
+                if abs(actual - expected) >= self._adapter.slider_tolerance(n):
+                    reason = f'slider {n} moved externally ({expected} -> {actual})'
+                    break
+            if not reason and (c.expected_sv is not None or c.expected_pid is not None):
+                pid = self._adapter.pid_info()
+                if c.expected_sv is not None and now - (c.last_sv_write or 0.0) >= MANUAL_OVERRIDE_GRACE:
+                    sv = pid.get('sv')
+                    if pid.get('mode') != 'manual':
+                        reason = f"SV mode changed to {pid.get('mode')}"
+                    elif sv is None or abs(sv - c.expected_sv) >= SV_TOLERANCE:
+                        reason = f'SV changed externally ({c.expected_sv} -> {sv})'
+                if not reason and c.expected_pid is not None and now - (c.last_pid_write or 0.0) >= MANUAL_OVERRIDE_GRACE:
+                    active = bool(pid.get('active'))
+                    if active != c.expected_pid:
+                        reason = f"PID switched {'on' if active else 'off'} externally"
+            if reason:
+                c.override = True
+                c.override_reason = reason
+                _log.info('WebAPI manual override: %s', reason)
+
+    def _write_lock_error(self) -> web.Response|None:
+        """Returns an error response if writes are currently locked. Call with self._lock held."""
+        if self._control.watchdog_tripped:
+            return self._error(409, 'watchdog tripped; POST /api/v1/release to resume')
+        if self._control.override:
+            return self._error(409, f'manual override active ({self._control.override_reason}); POST /api/v1/release to resume')
+        return None
+
+    def _too_soon(self, last:float|None, now:float) -> bool:
+        return self._config.min_interval > 0 and last is not None and now - last < self._config.min_interval
+
+    def _arm_watchdog(self) -> None:
+        """Call with self._lock held after a successful write."""
+        if self._adapter.is_recording():
+            self._control.watchdog_armed = self._config.watchdog_timeout > 0
 
     @staticmethod
     async def _read_json(request:web.Request) -> dict[str, Any]|None:
@@ -265,24 +325,80 @@ class WebAPI:
         self._check_manual_override()
         now = time.monotonic()
         lo, hi = self._adapter.slider_limits(n)
-        target = int(min(max(round(value), lo), hi))
+        step = max(1, self._adapter.slider_step(n))
+        # snap to the slider's step size as a drag in the UI would, then clamp
+        target = int(min(max(round(value / step) * step, lo), hi))
         with self._lock:
-            if self._control.watchdog_tripped:
-                return self._error(409, 'watchdog tripped; POST /api/v1/release to resume')
-            if self._control.override:
-                return self._error(409, f'manual override active ({self._control.override_reason}); POST /api/v1/release to resume')
-            last = self._control.last_write.get(n)
-            if self._config.min_interval > 0 and last is not None and now - last < self._config.min_interval:
+            locked = self._write_lock_error()
+            if locked is not None:
+                return locked
+            if self._too_soon(self._control.last_write.get(n), now):
                 return self._error(429, f'slider {n} written less than {self._config.min_interval}s ago')
             current = self._adapter.slider_value(n)
-            if self._config.max_step > 0 and abs(target - current) > self._config.max_step:
+            if 0 < self._config.max_step < abs(target - current):
                 return self._error(422, f'step {abs(target - current)} exceeds max_step {self._config.max_step}')
             self._control.expected[n] = target
             self._control.last_write[n] = now
-            if self._adapter.is_recording():
-                self._control.watchdog_armed = self._config.watchdog_timeout > 0
+            self._arm_watchdog()
         self._adapter.set_slider(n, target)
         return self._json({'slider': n, 'requested': value, 'value': target, 'clamped': target != value})
+
+    async def handle_sv(self, request:web.Request) -> web.Response:
+        data = await self._read_json(request)
+        if data is None:
+            return self._error(400, 'expected a JSON object')
+        value = data.get('value')
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            return self._error(400, 'value must be a number')
+        pid = self._adapter.pid_info()
+        if not pid.get('available'):
+            return self._error(409, 'no PID configured in Artisan')
+        if pid.get('mode') != 'manual':
+            return self._error(409, f"SV is driven by {pid.get('mode')} mode; switch the PID to manual SV mode")
+
+        self._check_manual_override()
+        now = time.monotonic()
+        target = round(min(max(float(value), float(pid['sv_min'])), float(pid['sv_max'])), 1)
+        with self._lock:
+            locked = self._write_lock_error()
+            if locked is not None:
+                return locked
+            if self._too_soon(self._control.last_sv_write, now):
+                return self._error(429, f'SV written less than {self._config.min_interval}s ago')
+            current = pid.get('sv')
+            if self._config.max_sv_step > 0 and current is not None and abs(target - current) > self._config.max_sv_step:
+                return self._error(422, f'SV step {abs(target - current):.1f} exceeds max_sv_step {self._config.max_sv_step}')
+            self._control.expected_sv = target
+            self._control.last_sv_write = now
+            self._arm_watchdog()
+        self._adapter.set_sv(target)
+        return self._json({'requested': value, 'sv': target, 'clamped': target != value})
+
+    async def handle_pid(self, request:web.Request) -> web.Response:
+        data = await self._read_json(request)
+        if data is None:
+            return self._error(400, 'expected a JSON object')
+        on = data.get('on')
+        if not isinstance(on, bool):
+            return self._error(400, 'on must be true or false')
+        if not self._adapter.pid_info().get('available'):
+            return self._error(409, 'no PID configured in Artisan')
+        if on:
+            self._check_manual_override()
+        now = time.monotonic()
+        with self._lock:
+            # switching off is the safe direction: accepted even when locked or rate limited
+            if on:
+                locked = self._write_lock_error()
+                if locked is not None:
+                    return locked
+                if self._too_soon(self._control.last_pid_write, now):
+                    return self._error(429, f'PID switched less than {self._config.min_interval}s ago')
+                self._arm_watchdog()
+            self._control.expected_pid = on
+            self._control.last_pid_write = now
+        self._adapter.set_pid(on)
+        return self._json({'pid': on})
 
     async def handle_event(self, request:web.Request) -> web.Response:
         data = await self._read_json(request)
@@ -301,9 +417,17 @@ class WebAPI:
             self._control.override = False
             self._control.override_reason = ''
             self._control.watchdog_tripped = False
-            # re-baseline expectations against the current slider positions
+            # re-baseline expectations against the current slider positions / PID state
             for n in list(self._control.expected):
                 self._control.expected[n] = self._adapter.slider_value(n)
+            if self._control.expected_sv is not None or self._control.expected_pid is not None:
+                pid = self._adapter.pid_info()
+                if self._control.expected_sv is not None:
+                    sv = pid.get('sv')
+                    # SV not in manual mode or unknown: stop tracking until the API sets it again
+                    self._control.expected_sv = sv if sv is not None and pid.get('mode') == 'manual' else None
+                if self._control.expected_pid is not None:
+                    self._control.expected_pid = bool(pid.get('active'))
         return self._json({'control': self._control_info()})
 
     # ---------------------------------------------------------------- watchdog
@@ -322,6 +446,10 @@ class WebAPI:
             c.watchdog_tripped = True
             n = self._config.watchdog_slider
             value = 0
+            pid_off = self._config.watchdog_pid_off and bool(self._adapter.pid_info().get('active'))
+            if pid_off:
+                c.expected_pid = False
+                c.last_pid_write = time.monotonic()
             apply_fallback = 0 <= n < self._adapter.slider_count()
             if apply_fallback:
                 lo, hi = self._adapter.slider_limits(n)
@@ -329,6 +457,9 @@ class WebAPI:
                 c.expected[n] = value
                 c.last_write[n] = time.monotonic()
         _log.warning('WebAPI watchdog tripped after %ss without requests', self._config.watchdog_timeout)
+        # PID off first, so a hardware PID does not override the fallback slider value
+        if pid_off:
+            self._adapter.set_pid(False)
         if apply_fallback:
             self._adapter.set_slider(n, value)
         return True
@@ -421,6 +552,43 @@ class AppAdapter:
     def slider_limits(self, n:int) -> tuple[int, int]:
         return int(self.aw.eventslidermin[n]), int(self.aw.eventslidermax[n])
 
+    def slider_step(self, n:int) -> int:
+        return int(self.aw.eventSliderStepSize(n))
+
+    def slider_tolerance(self, n:int) -> int:
+        # with an active quantifier the slider follows a (machine) reading rounded to the quantifier step
+        if self.aw.eventquantifieractive[n]:
+            return {1: 10, 2: 5}.get(int(self.aw.eventquantifiercoarse[n]), 1)
+        return 1
+
+    def pid_info(self) -> dict[str, Any]:
+        aw = self.aw
+        pc = aw.pidcontrol
+        # Fuji PIDs (device 0) are driven through a different code path and are not supported (yet)
+        external = pc.externalPIDControl()
+        available = aw.qmc.device != 0 and (external in {1, 2, 3} or bool(aw.qmc.Controlbuttonflag))
+        mode = SV_MODES[pc.svMode] if 0 <= pc.svMode < len(SV_MODES) else str(pc.svMode)
+        source = {1: 'BT', 2: 'ET'}.get(pc.pidSource, 'extra')
+        return {
+            'available': available,
+            'active': bool(pc.pidActive),
+            'sv': self._r(pc.sv),
+            'sv_min': float(pc.svSliderMin),
+            'sv_max': float(pc.svSliderMax),
+            'mode': mode,
+            'source': source,
+            'kind': ('software', 'modbus', 's7', 'tc4', 'kaleido')[external] if 0 <= external <= 4 else 'unknown',
+        }
+
+    def set_sv(self, value:float) -> None:
+        self.aw.setSVSignal.emit(float(value))
+
+    def set_pid(self, on:bool) -> None:
+        if on:
+            self.aw.pidOnSignal.emit()
+        else:
+            self.aw.pidOffSignal.emit()
+
     def is_recording(self) -> bool:
         return bool(self.aw.qmc.flagstart)
 
@@ -498,7 +666,9 @@ class AppAdapter:
                 'value': int(aw.eventslidervalues[n]),
                 'min': int(aw.eventslidermin[n]),
                 'max': int(aw.eventslidermax[n]),
+                'step': self.slider_step(n),
                 'visible': bool(aw.eventslidervisibilities[n]),
             } for n in range(4)
         ]
+        state['pid'] = self.pid_info()
         return state
