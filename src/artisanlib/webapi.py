@@ -35,7 +35,10 @@ Endpoints (all JSON):
   GET  /api/v1/wait?timeout=30&until=event   long-poll; returns on event, next sample or timeout
   POST /api/v1/slider   {"slider": 0..3, "value": n}
   POST /api/v1/sv       {"value": n}          PID set value (manual SV mode only)
-  POST /api/v1/pid      {"on": true|false}    PID on/off ("off" is always accepted)
+  POST /api/v1/pid      {"on": bool, "mode": "manual"|"background", "lookahead": s}
+                        PID on/off, SV mode, lookahead (any subset; "on": false alone is always accepted)
+  POST /api/v1/background {"shift_temp": n, "shift_time": s}
+                        move the background profile (with the PID following it: move the target curve)
   POST /api/v1/event    {"event": "CHARGE"|"DRY"|"FCs"|"FCe"|"SCs"|"SCe"|"DROP"|"COOL"}
   POST /api/v1/stop     emergency stop: PID off + fallback slider value, then locked (always accepted)
   POST /api/v1/release  clears a manual-override, watchdog or stop lock
@@ -78,6 +81,9 @@ MAX_WAIT_TIMEOUT: Final[float] = 120.0
 MANUAL_OVERRIDE_GRACE: Final[float] = 3.0 # seconds to wait for a queued slider move to land before comparing
 SV_TOLERANCE: Final[float] = 0.5 # SV differences below this are not considered an external change
 SV_MODES: Final[tuple[str, ...]] = ('manual', 'ramp_soak', 'background')
+SETTABLE_SV_MODES: Final[tuple[str, ...]] = ('manual', 'background') # ramp/soak needs a program set up in the PID dialog
+MAX_LOOKAHEAD: Final[int] = 60 # seconds
+MAX_BACKGROUND_TIME_SHIFT: Final[int] = 120 # seconds per request
 FALLBACK_NONE: Final[int] = -1  # watchdog_slider: no fallback slider
 FALLBACK_AUTO: Final[int] = -2  # watchdog_slider: the PID's heat slider (positive target), set to its minimum
 
@@ -97,6 +103,10 @@ class ArtisanAdapter(Protocol):
     def pid_info(self) -> dict[str, Any]: ...
     def set_sv(self, value:float) -> None: ...
     def set_pid(self, on:bool) -> None: ...
+    def set_pid_mode(self, mode:str) -> None: ...
+    def set_pid_lookahead(self, seconds:int) -> None: ...
+    def background_info(self) -> dict[str, Any]: ...
+    def shift_background(self, temp:int, time_s:int) -> None: ...
     def is_recording(self) -> bool: ...
     def mark_event(self, name:str) -> None: ...
 
@@ -125,6 +135,9 @@ class ControlState:
     last_sv_write: float|None = None
     expected_pid: bool|None = None  # last PID state set via the API
     last_pid_write: float|None = None
+    expected_mode: str|None = None  # last PID SV mode set via the API
+    expected_shift: tuple[int, int]|None = None # (temp, time) background shift after the last API move
+    last_shift_write: float|None = None
     override: bool = False
     override_reason: str = ''
     watchdog_armed: bool = False
@@ -158,6 +171,7 @@ class WebAPI:
             web.post('/api/v1/slider', self.handle_slider),
             web.post('/api/v1/sv', self.handle_sv),
             web.post('/api/v1/pid', self.handle_pid),
+            web.post('/api/v1/background', self.handle_background),
             web.post('/api/v1/event', self.handle_event),
             web.post('/api/v1/stop', self.handle_stop),
             web.post('/api/v1/release', self.handle_release),
@@ -250,6 +264,15 @@ class WebAPI:
                     active = bool(pid.get('active'))
                     if active != c.expected_pid:
                         reason = f"PID switched {'on' if active else 'off'} externally"
+            if not reason and c.expected_mode is not None and now - (c.last_pid_write or 0.0) >= MANUAL_OVERRIDE_GRACE:
+                mode = self._adapter.pid_info().get('mode')
+                if mode != c.expected_mode:
+                    reason = f'SV mode changed externally ({c.expected_mode} -> {mode})'
+            if not reason and c.expected_shift is not None and now - (c.last_shift_write or 0.0) >= MANUAL_OVERRIDE_GRACE:
+                bg = self._adapter.background_info()
+                shift = (int(bg.get('shift_temp', 0)), int(bg.get('shift_time', 0)))
+                if shift != c.expected_shift:
+                    reason = f'background moved externally (temp, time {c.expected_shift} -> {shift})'
             if reason:
                 c.override = True
                 c.override_reason = reason
@@ -392,26 +415,89 @@ class WebAPI:
         if data is None:
             return self._error(400, 'expected a JSON object')
         on = data.get('on')
-        if not isinstance(on, bool):
+        mode = data.get('mode')
+        lookahead = data.get('lookahead')
+        if on is None and mode is None and lookahead is None:
+            return self._error(400, 'expected at least one of on, mode, lookahead')
+        if on is not None and not isinstance(on, bool):
             return self._error(400, 'on must be true or false')
+        if mode is not None and mode not in SETTABLE_SV_MODES:
+            return self._error(400, f"mode must be one of {', '.join(SETTABLE_SV_MODES)}")
+        if lookahead is not None and (not isinstance(lookahead, int) or isinstance(lookahead, bool) or not 0 <= lookahead <= MAX_LOOKAHEAD):
+            return self._error(400, f'lookahead must be an integer 0..{MAX_LOOKAHEAD} (seconds)')
         if not self._adapter.pid_info().get('available'):
             return self._error(409, 'no PID configured in Artisan')
-        if on:
+        if mode == 'background' and not self._adapter.background_info().get('loaded'):
+            return self._error(409, 'no background profile loaded and shown')
+        # switching off (alone) is the safe direction: accepted even when locked or rate limited
+        only_off = on is False and mode is None and lookahead is None
+        if not only_off:
             self._check_manual_override()
         now = time.monotonic()
         with self._lock:
-            # switching off is the safe direction: accepted even when locked or rate limited
-            if on:
+            if not only_off:
                 locked = self._write_lock_error()
                 if locked is not None:
                     return locked
                 if self._too_soon(self._control.last_pid_write, now):
-                    return self._error(429, f'PID switched less than {self._config.min_interval}s ago')
+                    return self._error(429, f'PID changed less than {self._config.min_interval}s ago')
                 self._arm_watchdog()
-            self._control.expected_pid = on
+            if on is not None:
+                self._control.expected_pid = on
+            if mode is not None:
+                self._control.expected_mode = mode
+                if mode != 'manual':
+                    self._control.expected_sv = None # the SV now follows the mode
             self._control.last_pid_write = now
-        self._adapter.set_pid(on)
-        return self._json({'pid': on})
+        if on is False:
+            self._adapter.set_pid(False) # off first
+        if lookahead is not None:
+            self._adapter.set_pid_lookahead(lookahead)
+        if mode is not None:
+            self._adapter.set_pid_mode(mode) # before on, so the PID starts in the requested mode
+        if on is True:
+            self._adapter.set_pid(True)
+        result:dict[str, Any] = {}
+        for key, val in (('pid', on), ('mode', mode), ('lookahead', lookahead)):
+            if val is not None:
+                result[key] = val
+        return self._json(result)
+
+    async def handle_background(self, request:web.Request) -> web.Response:
+        """Shift the background profile: temperature (up +) and/or time (later +). With the PID
+        following the background, this moves the target curve, e.g. 'run 5F hotter from here'."""
+        data = await self._read_json(request)
+        if data is None:
+            return self._error(400, 'expected a JSON object')
+        temp = data.get('shift_temp', 0)
+        time_s = data.get('shift_time', 0)
+        for name, val in (('shift_temp', temp), ('shift_time', time_s)):
+            if not isinstance(val, int) or isinstance(val, bool):
+                return self._error(400, f'{name} must be an integer')
+        if temp == 0 and time_s == 0:
+            return self._error(400, 'expected a non-zero shift_temp and/or shift_time')
+        if abs(time_s) > MAX_BACKGROUND_TIME_SHIFT:
+            return self._error(422, f'shift_time exceeds {MAX_BACKGROUND_TIME_SHIFT}s')
+        if 0 < self._config.max_sv_step < abs(temp):
+            return self._error(422, f'shift_temp {abs(temp)} exceeds max_sv_step {self._config.max_sv_step}')
+        bg = self._adapter.background_info()
+        if not bg.get('loaded'):
+            return self._error(409, 'no background profile loaded and shown')
+
+        self._check_manual_override()
+        now = time.monotonic()
+        with self._lock:
+            locked = self._write_lock_error()
+            if locked is not None:
+                return locked
+            if self._too_soon(self._control.last_shift_write, now):
+                return self._error(429, f'background moved less than {self._config.min_interval}s ago')
+            shift = (int(bg.get('shift_temp', 0)) + temp, int(bg.get('shift_time', 0)) + time_s)
+            self._control.expected_shift = shift
+            self._control.last_shift_write = now
+            self._arm_watchdog()
+        self._adapter.shift_background(temp, time_s)
+        return self._json({'shift_temp': shift[0], 'shift_time': shift[1]})
 
     async def handle_event(self, request:web.Request) -> web.Response:
         data = await self._read_json(request)
@@ -459,6 +545,11 @@ class WebAPI:
                     self._control.expected_sv = sv if sv is not None and pid.get('mode') == 'manual' else None
                 if self._control.expected_pid is not None:
                     self._control.expected_pid = bool(pid.get('active'))
+            if self._control.expected_mode is not None:
+                self._control.expected_mode = self._adapter.pid_info().get('mode')
+            if self._control.expected_shift is not None:
+                bg = self._adapter.background_info()
+                self._control.expected_shift = (int(bg.get('shift_temp', 0)), int(bg.get('shift_time', 0)))
         return self._json({'control': self._control_info()})
 
     # ---------------------------------------------------------------- watchdog
@@ -640,10 +731,35 @@ class AppAdapter:
             'source': source,
             'kind': kind,
             'sv_tolerance': sv_tolerance,
+            'lookahead': int(pc.svLookahead),
         }
 
     def set_sv(self, value:float) -> None:
         self.aw.setSVSignal.emit(float(value))
+
+    def set_pid_mode(self, mode:str) -> None:
+        self.aw.pidModeSignal.emit(SV_MODES.index(mode))
+
+    def set_pid_lookahead(self, seconds:int) -> None:
+        self.aw.pidLookaheadSignal.emit(int(seconds))
+
+    def background_info(self) -> dict[str, Any]:
+        qmc = self.aw.qmc
+        loaded = bool(qmc.background) and len(qmc.timeB) > 0 # PID follow mode needs it shown
+        return {
+            'loaded': loaded,
+            'title': str(qmc.titleB) if loaded else None,
+            'charged': loaded and qmc.timeindexB[0] > -1,
+            'shift_temp': int(qmc.backgroundprofile_moved_y),
+            'shift_time': int(qmc.backgroundprofile_moved_x),
+        }
+
+    def shift_background(self, temp:int, time_s:int) -> None:
+        sig = self.aw.qmc.moveBackgroundSignal
+        if temp:
+            sig.emit('up' if temp > 0 else 'down', abs(temp))
+        if time_s:
+            sig.emit('right' if time_s > 0 else 'left', abs(time_s))
 
     def set_pid(self, on:bool) -> None:
         if on:
@@ -733,4 +849,5 @@ class AppAdapter:
             } for n in range(4)
         ]
         state['pid'] = self.pid_info()
+        state['background'] = self.background_info()
         return state

@@ -30,6 +30,10 @@ class FakeAdapter:
         self.sv_calls: list[float] = []
         self.pid_calls: list[bool] = []
         self.heat: int|None = None
+        self.bg: dict[str, Any] = {'loaded': True, 'title': 'ref', 'charged': True, 'shift_temp': 0, 'shift_time': 0}
+        self.mode_calls: list[str] = []
+        self.lookahead_calls: list[int] = []
+        self.calls: list[str] = [] # order of PID-related calls
 
     def snapshot(self) -> dict[str, Any]:
         return {'bt': 200.0, 'sliders': list(self.values)}
@@ -57,7 +61,20 @@ class FakeAdapter:
         self.pid['sv'] = value
     def set_pid(self, on:bool) -> None:
         self.pid_calls.append(on)
+        self.calls.append(f'pid {on}')
         self.pid['active'] = on
+    def set_pid_mode(self, mode:str) -> None:
+        self.mode_calls.append(mode)
+        self.calls.append(f'mode {mode}')
+        self.pid['mode'] = mode
+    def set_pid_lookahead(self, seconds:int) -> None:
+        self.lookahead_calls.append(seconds)
+        self.calls.append(f'lookahead {seconds}')
+    def background_info(self) -> dict[str, Any]:
+        return dict(self.bg)
+    def shift_background(self, temp:int, time_s:int) -> None:
+        self.bg['shift_temp'] += temp
+        self.bg['shift_time'] += time_s
     def is_recording(self) -> bool:
         return self.recording
     def mark_event(self, name:str) -> None:
@@ -488,6 +505,86 @@ async def test_stop_without_anything_configured_warns(adapter:FakeAdapter) -> No
 
 
 @pytest.mark.asyncio
+async def test_pid_mode_and_lookahead(adapter:FakeAdapter) -> None:
+    client = await make_client(WebAPI(adapter, WebAPIConfig(min_interval=0)))
+    try:
+        resp = await client.post('/api/v1/pid', json={'mode': 'background', 'lookahead': 5, 'on': True})
+        assert resp.status == 200
+        assert await resp.json() == {'pid': True, 'mode': 'background', 'lookahead': 5}
+        assert adapter.calls == ['lookahead 5', 'mode background', 'pid True'] # mode before on
+        assert (await client.post('/api/v1/pid', json={})).status == 400
+        assert (await client.post('/api/v1/pid', json={'mode': 'ramp_soak'})).status == 400
+        assert (await client.post('/api/v1/pid', json={'lookahead': 61})).status == 400
+        assert (await client.post('/api/v1/pid', json={'lookahead': True})).status == 400
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_pid_background_mode_needs_background(adapter:FakeAdapter) -> None:
+    adapter.bg['loaded'] = False
+    client = await make_client(WebAPI(adapter, WebAPIConfig()))
+    try:
+        assert (await client.post('/api/v1/pid', json={'mode': 'background'})).status == 409
+        assert (await client.post('/api/v1/background', json={'shift_temp': 5})).status == 409
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_pid_off_with_mode_is_not_exempt_from_locks(adapter:FakeAdapter) -> None:
+    api = WebAPI(adapter, WebAPIConfig(min_interval=0))
+    client = await make_client(api)
+    try:
+        assert (await client.post('/api/v1/stop')).status == 200
+        assert (await client.post('/api/v1/pid', json={'on': False, 'mode': 'manual'})).status == 409
+        assert (await client.post('/api/v1/pid', json={'on': False})).status == 200
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_switching_to_background_stops_tracking_sv(adapter:FakeAdapter) -> None:
+    api = WebAPI(adapter, WebAPIConfig(min_interval=0))
+    client = await make_client(api)
+    try:
+        assert (await client.post('/api/v1/sv', json={'value': 300})).status == 200
+        assert (await client.post('/api/v1/pid', json={'mode': 'background'})).status == 200
+        _age_writes(api)
+        adapter.pid['sv'] = 352.0 # SV now follows the background curve
+        assert (await (await client.get('/api/v1/state')).json())['control']['override'] is False
+        adapter.pid['mode'] = 'manual' # user switched the mode back
+        state = await (await client.get('/api/v1/state')).json()
+        assert 'SV mode changed externally' in state['control']['override_reason']
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_background_shift(adapter:FakeAdapter) -> None:
+    api = WebAPI(adapter, WebAPIConfig(min_interval=10, max_sv_step=10))
+    client = await make_client(api)
+    try:
+        assert (await client.post('/api/v1/background', json={'shift_temp': 15})).status == 422
+        assert (await client.post('/api/v1/background', json={'shift_time': 121})).status == 422
+        assert (await client.post('/api/v1/background', json={})).status == 400
+        assert (await client.post('/api/v1/background', json={'shift_temp': 2.5})).status == 400
+        data = await (await client.post('/api/v1/background', json={'shift_temp': 5, 'shift_time': -30})).json()
+        assert data == {'shift_temp': 5, 'shift_time': -30}
+        assert (await client.post('/api/v1/background', json={'shift_temp': 5})).status == 429
+        _age_writes(api)
+        api._control.last_shift_write = 0.0 # pylint: disable=protected-access
+        assert (await (await client.get('/api/v1/state')).json())['control']['override'] is False
+        adapter.bg['shift_temp'] = 0 # user moved the background back
+        state = await (await client.get('/api/v1/state')).json()
+        assert 'background moved externally' in state['control']['override_reason']
+        assert (await client.post('/api/v1/release')).status == 200
+        assert api._control.expected_shift == (0, -30) # pylint: disable=protected-access
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_sv_mode_switch_engages_override(adapter:FakeAdapter) -> None:
     api = WebAPI(adapter, WebAPIConfig(min_interval=0))
     client = await make_client(api)
@@ -595,6 +692,12 @@ def aw() -> Mock:
     aw.pidcontrol.svSliderMax = 446
     aw.pidcontrol.svMode = 0
     aw.pidcontrol.pidSource = 1
+    aw.pidcontrol.svLookahead = 4
+    aw.qmc.timeB = [0.0, 1.0]
+    aw.qmc.titleB = 'Colombia v1'
+    aw.qmc.timeindexB = [0, 0, 0, 0, 0, 0, 0, 0]
+    aw.qmc.backgroundprofile_moved_x = -10
+    aw.qmc.backgroundprofile_moved_y = 5
     return aw
 
 
@@ -609,7 +712,11 @@ def test_app_adapter_snapshot(aw:Mock) -> None:
     assert s['events']['DRY'] is None
     assert s['sliders'][2] == {'slider': 2, 'name': 'Damper', 'value': 30, 'min': 0, 'max': 9, 'step': 1, 'visible': True}
     assert s['pid'] == {'available': True, 'active': True, 'sv': 149.0, 'sv_min': 0.0, 'sv_max': 446.0,
-                        'mode': 'manual', 'source': 'BT', 'kind': 'kaleido', 'sv_tolerance': 3.0}
+                        'mode': 'manual', 'source': 'BT', 'kind': 'kaleido', 'sv_tolerance': 3.0, 'lookahead': 4}
+    assert s['background'] == {'loaded': False, 'title': None, 'charged': False, 'shift_temp': 5, 'shift_time': -10} # hidden
+    aw.qmc.background = True
+    assert AppAdapter(aw).snapshot()['background'] == {'loaded': True, 'title': 'Colombia v1', 'charged': True,
+                                                       'shift_temp': 5, 'shift_time': -10}
 
 
 def test_app_adapter_heat_slider(aw:Mock) -> None:
@@ -678,3 +785,9 @@ def test_app_adapter_writes(aw:Mock) -> None:
     aw.pidOnSignal.emit.assert_called_once_with()
     a.set_pid(False)
     aw.pidOffSignal.emit.assert_called_once_with()
+    a.set_pid_mode('background')
+    aw.pidModeSignal.emit.assert_called_once_with(2)
+    a.set_pid_lookahead(6)
+    aw.pidLookaheadSignal.emit.assert_called_once_with(6)
+    a.shift_background(-5, 30)
+    assert aw.qmc.moveBackgroundSignal.emit.call_args_list == [(('down', 5),), (('right', 30),)]

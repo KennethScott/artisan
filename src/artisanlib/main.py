@@ -1393,6 +1393,8 @@ class ApplicationWindow(QMainWindow):
     pidOnSignal = pyqtSignal()
     pidOffSignal = pyqtSignal()
     pidToggleSignal = pyqtSignal()
+    pidModeSignal = pyqtSignal(int) # 0: manual, 1: ramp/soak, 2: background
+    pidLookaheadSignal = pyqtSignal(int)
     notificationsSetEnabledSignal = pyqtSignal(bool)
     santokerSendMessageSignal = pyqtSignal(bytes,int)
     kaleidoSendMessageSignal = pyqtSignal(str,str)
@@ -3958,6 +3960,8 @@ class ApplicationWindow(QMainWindow):
         self.pidOnSignal.connect(self.pidOn)
         self.pidOffSignal.connect(self.pidOff)
         self.pidToggleSignal.connect(self.pidToggle)
+        self.pidModeSignal.connect(self.setPIDMode)
+        self.pidLookaheadSignal.connect(self.setPIDLookahead)
         self.notificationsSetEnabledSignal.connect(self.notificationsSetEnabled)
         self.santokerSendMessageSignal.connect(self.santokerSendMessage)
         self.kaleidoSendMessageSignal.connect(self.kaleidoSendMessage)
@@ -4405,6 +4409,19 @@ class ApplicationWindow(QMainWindow):
     @pyqtSlot()
     def pidToggle(self) -> None:
         self.pidcontrol.togglePID()
+    @pyqtSlot(int)
+    def setPIDMode(self, mode:int) -> None:
+        # as the pidmode(<n>) Artisan command and the PID dialog do for the non-Fuji PIDs
+        if 0 <= mode <= 2 and mode != self.pidcontrol.svMode:
+            self.pidcontrol.svMode = mode
+            if self.pidcontrol.pidActive and mode == 1:
+                self.pidcontrol.pidModeInit()
+            self.sendmessage(QApplication.translate('Message', 'PID mode {0}').format(
+                (QApplication.translate('Label', 'Manual'), QApplication.translate('Label', 'Ramp/Soak'),
+                 QApplication.translate('Label', 'Background'))[mode]))
+    @pyqtSlot(int)
+    def setPIDLookahead(self, seconds:int) -> None:
+        self.pidcontrol.svLookahead = max(0, seconds)
 
     def zoomIn(self) -> None:
         self.setdpi(self.dpi+10)
