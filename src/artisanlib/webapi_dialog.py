@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QCheckBox, QComboBox, QDoubl
     QGroupBox, QHBoxLayout, QLabel, QSpinBox, QVBoxLayout)
 
 from artisanlib.dialogs import ArtisanDialog
+from artisanlib.webapi import FALLBACK_AUTO, FALLBACK_NONE
 
 if TYPE_CHECKING:
     from artisanlib.main import ApplicationWindow # pylint: disable=unused-import
@@ -69,7 +70,8 @@ class WebAPISettingsDlg(ArtisanDialog):
         limitsGroup.setLayout(limitsLayout)
 
         self.fallbackSlider = QComboBox()
-        self.fallbackSlider.addItem(QApplication.translate('ComboBox', 'None'), -1)
+        self.fallbackSlider.addItem(QApplication.translate('ComboBox', 'Auto'), FALLBACK_AUTO)
+        self.fallbackSlider.addItem(QApplication.translate('ComboBox', 'None'), FALLBACK_NONE)
         for n in range(4):
             self.fallbackSlider.addItem(str(aw.qmc.etypes[n]), n)
         self.fallbackSlider.setCurrentIndex(max(0, self.fallbackSlider.findData(aw.WebAPIWatchdogSlider)))
@@ -77,11 +79,17 @@ class WebAPISettingsDlg(ArtisanDialog):
         self.fallbackValue = QSpinBox()
         self.fallbackValue.setRange(-9999, 9999)
         self.fallbackValue.setValue(aw.WebAPIWatchdogValue)
+        self.fallbackEquals = QLabel('=')
+        self.fallbackInfo = QLabel()
+        self.fallbackInfo.setWordWrap(True)
         fallbackLayout = QHBoxLayout()
         fallbackLayout.addWidget(self.fallbackSlider)
-        fallbackLayout.addWidget(QLabel('='))
+        fallbackLayout.addWidget(self.fallbackEquals)
         fallbackLayout.addWidget(self.fallbackValue)
         fallbackLayout.addStretch()
+        fallbackVLayout = QVBoxLayout()
+        fallbackVLayout.addLayout(fallbackLayout)
+        fallbackVLayout.addWidget(self.fallbackInfo)
         self.fallbackSliderChanged()
 
         self.watchdogTimeout = QSpinBox()
@@ -96,7 +104,7 @@ class WebAPISettingsDlg(ArtisanDialog):
         self.watchdogPIDOff.setToolTip(QApplication.translate('Tooltip', 'The watchdog also switches the PID off (STOP always does)'))
 
         safetyLayout = QFormLayout()
-        safetyLayout.addRow(QApplication.translate('Label', 'Fallback'), fallbackLayout)
+        safetyLayout.addRow(QApplication.translate('Label', 'Fallback'), fallbackVLayout)
         safetyLayout.addRow(QApplication.translate('Label', 'Watchdog'), self.watchdogTimeout)
         safetyLayout.addRow('', self.watchdogPIDOff)
         hint = QLabel(QApplication.translate('Label',
@@ -120,11 +128,28 @@ class WebAPISettingsDlg(ArtisanDialog):
     @pyqtSlot(int)
     def fallbackSliderChanged(self, _:int = 0) -> None:
         n = self.fallbackSlider.currentData()
-        if isinstance(n, int) and 0 <= n < 4:
+        explicit = isinstance(n, int) and 0 <= n < 4
+        self.fallbackValue.setVisible(explicit)
+        self.fallbackEquals.setVisible(explicit)
+        if explicit:
+            assert isinstance(n, int)
             self.fallbackValue.setRange(int(self.aw.eventslidermin[n]), int(self.aw.eventslidermax[n]))
-            self.fallbackValue.setEnabled(True)
+            self.fallbackInfo.setText('')
+        elif n == FALLBACK_AUTO:
+            heat = self.heatSlider()
+            if heat is None:
+                self.fallbackInfo.setText(QApplication.translate('Label',
+                    'No PID heat slider configured: STOP and the watchdog cannot cut heat'))
+            else:
+                self.fallbackInfo.setText(QApplication.translate('Label', 'PID heat slider: {0} = {1}').format(
+                    self.aw.qmc.etypes[heat], int(self.aw.eventslidermin[heat])))
         else:
-            self.fallbackValue.setEnabled(False)
+            self.fallbackInfo.setText(QApplication.translate('Label', 'STOP and the watchdog cannot cut heat'))
+        self.fallbackInfo.setVisible(bool(self.fallbackInfo.text()))
+
+    def heatSlider(self) -> int|None:
+        target = int(self.aw.pidcontrol.pidPositiveTarget)
+        return target - 1 if 1 <= target <= 4 else None
 
     @pyqtSlot()
     @override
@@ -134,7 +159,7 @@ class WebAPISettingsDlg(ArtisanDialog):
         aw.WebAPIMaxStep = int(self.maxStep.value())
         aw.WebAPIMaxSVStep = float(self.maxSVStep.value())
         data = self.fallbackSlider.currentData()
-        aw.WebAPIWatchdogSlider = data if isinstance(data, int) else -1
+        aw.WebAPIWatchdogSlider = data if isinstance(data, int) else FALLBACK_NONE
         aw.WebAPIWatchdogValue = int(self.fallbackValue.value())
         aw.WebAPIWatchdogTimeout = float(self.watchdogTimeout.value())
         aw.WebAPIWatchdogPIDOff = self.watchdogPIDOff.isChecked()

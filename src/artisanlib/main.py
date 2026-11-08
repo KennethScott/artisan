@@ -1635,7 +1635,7 @@ class ApplicationWindow(QMainWindow):
         self.WebAPIMaxStep:int = 0
         self.WebAPIMaxSVStep:float = 0.0
         self.WebAPIWatchdogTimeout:float = 0.0
-        self.WebAPIWatchdogSlider:int = -1
+        self.WebAPIWatchdogSlider:int = -2 # -2: auto (PID heat slider to its minimum), -1: none, 0..3: slider
         self.WebAPIWatchdogValue:int = 0
         self.WebAPIWatchdogPIDOff:bool = False
 
@@ -19936,6 +19936,9 @@ class ApplicationWindow(QMainWindow):
                     watchdog_pid_off=self.WebAPIWatchdogPIDOff))
                 if self.webapi_server.start():
                     self.WebAPIActive = True
+                    if self.webapi_server.fallback() is None:
+                        self.sendmessage(QApplication.translate('Message',
+                            'Local Control API: no fallback heat slider; STOP and the watchdog cannot cut heat'))
                     return True
                 self.stopWebAPI()
             return False

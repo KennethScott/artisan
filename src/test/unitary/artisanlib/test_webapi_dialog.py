@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 from PyQt6.QtWidgets import QApplication
 
+from artisanlib.webapi import FALLBACK_AUTO, FALLBACK_NONE
 from artisanlib.webapi_dialog import WebAPISettingsDlg
 
 
@@ -34,7 +35,22 @@ def aw() -> Mock:
     aw.WebAPIWatchdogSlider = -1
     aw.WebAPIWatchdogValue = 0
     aw.WebAPIWatchdogPIDOff = False
+    aw.pidcontrol.pidPositiveTarget = 4 # PID heat slider: Burner
     return aw
+
+
+@pytest.mark.usefixtures('qapp')
+def test_dialog_auto_shows_resolved_heat_slider(aw:Mock) -> None: # pylint: disable=redefined-outer-name
+    aw.WebAPIWatchdogSlider = FALLBACK_AUTO
+    dlg = WebAPISettingsDlg(None, aw)
+    assert dlg.fallbackSlider.currentText() == 'Auto'
+    assert not dlg.fallbackValue.isVisibleTo(dlg)
+    assert 'Burner = 0' in dlg.fallbackInfo.text()
+    aw.pidcontrol.pidPositiveTarget = 0
+    dlg.fallbackSliderChanged()
+    assert 'No PID heat slider' in dlg.fallbackInfo.text()
+    dlg.accept()
+    assert aw.WebAPIWatchdogSlider == FALLBACK_AUTO
 
 
 @pytest.mark.usefixtures('qapp')
@@ -44,7 +60,7 @@ def test_dialog_loads_current_settings(aw:Mock) -> None: # pylint: disable=redef
     dlg = WebAPISettingsDlg(None, aw)
     assert dlg.fallbackSlider.currentData() == 3
     assert dlg.fallbackSlider.currentText() == 'Burner'
-    assert dlg.fallbackValue.isEnabled()
+    assert dlg.fallbackValue.isVisibleTo(dlg)
     assert dlg.maxSVStep.value() == 15.0
     assert dlg.maxSVStep.suffix() == ' °F'
     dlg.deleteLater()
@@ -53,8 +69,9 @@ def test_dialog_loads_current_settings(aw:Mock) -> None: # pylint: disable=redef
 @pytest.mark.usefixtures('qapp')
 def test_dialog_none_fallback_disables_value(aw:Mock) -> None: # pylint: disable=redefined-outer-name
     dlg = WebAPISettingsDlg(None, aw)
-    assert dlg.fallbackSlider.currentData() == -1
-    assert not dlg.fallbackValue.isEnabled()
+    assert dlg.fallbackSlider.currentData() == FALLBACK_NONE
+    assert not dlg.fallbackValue.isVisibleTo(dlg)
+    assert 'cannot cut heat' in dlg.fallbackInfo.text()
     dlg.deleteLater()
 
 

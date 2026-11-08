@@ -78,6 +78,8 @@ MAX_WAIT_TIMEOUT: Final[float] = 120.0
 MANUAL_OVERRIDE_GRACE: Final[float] = 3.0 # seconds to wait for a queued slider move to land before comparing
 SV_TOLERANCE: Final[float] = 0.5 # SV differences below this are not considered an external change
 SV_MODES: Final[tuple[str, ...]] = ('manual', 'ramp_soak', 'background')
+FALLBACK_NONE: Final[int] = -1  # watchdog_slider: no fallback slider
+FALLBACK_AUTO: Final[int] = -2  # watchdog_slider: the PID's heat slider (positive target), set to its minimum
 
 
 class ArtisanAdapter(Protocol):
@@ -90,6 +92,7 @@ class ArtisanAdapter(Protocol):
     def slider_limits(self, n:int) -> tuple[int, int]: ...
     def slider_step(self, n:int) -> int: ...
     def slider_tolerance(self, n:int) -> int: ...
+    def heat_slider(self) -> int|None: ...
     def set_slider(self, n:int, value:int) -> None: ...
     def pid_info(self) -> dict[str, Any]: ...
     def set_sv(self, value:float) -> None: ...
@@ -107,8 +110,10 @@ class WebAPIConfig:
     max_step: int = 0               # maximum slider change per write (0: unlimited)
     max_sv_step: float = 0.0        # maximum SV change per write, in temperature units (0: unlimited)
     watchdog_timeout: float = 0.0   # seconds without any request before the watchdog trips (0: off)
-    watchdog_slider: int = -1       # fallback slider set on watchdog trip and on /stop, typically heat (-1: none)
-    watchdog_value: int = 0         # value applied to watchdog_slider
+    # fallback slider set on watchdog trip and on /stop: FALLBACK_AUTO (the PID's heat slider at its
+    # minimum), FALLBACK_NONE, or an explicit slider 0..3 set to watchdog_value
+    watchdog_slider: int = FALLBACK_AUTO
+    watchdog_value: int = 0         # value applied to an explicit watchdog_slider
     watchdog_pid_off: bool = False  # switch the PID off on trip
 
 
@@ -197,6 +202,7 @@ class WebAPI:
         return cls._json({'error': message}, status)
 
     def _control_info(self) -> dict[str, Any]:
+        fallback = self.fallback()
         with self._lock:
             return {
                 'override': self._control.override,
@@ -205,6 +211,7 @@ class WebAPI:
                 'watchdog_tripped': self._control.watchdog_tripped,
                 'watchdog_timeout': self._config.watchdog_timeout,
                 'stopped': self._control.stopped,
+                'fallback': {'slider': fallback[0], 'value': fallback[1]} if fallback is not None else None,
             }
 
     def _state(self) -> dict[str, Any]:
@@ -431,6 +438,8 @@ class WebAPI:
         result:dict[str, Any] = {'actions': actions, 'control': self._control_info()}
         if not actions:
             result['warning'] = 'no PID and no fallback slider configured; writes locked but nothing was changed'
+        elif n < 0:
+            result['warning'] = 'no fallback slider configured; only the PID was switched off'
         return self._json(result)
 
     async def handle_release(self, _request:web.Request) -> web.Response:
@@ -479,16 +488,26 @@ class WebAPI:
         if pid_off:
             c.expected_pid = False
             c.last_pid_write = now
+        fallback = self.fallback()
+        if fallback is None:
+            return pid_off, -1, 0
+        n, value = fallback
+        c.expected[n] = value
+        c.last_write[n] = now
+        return pid_off, n, value
+
+    def fallback(self) -> tuple[int, int]|None:
+        """The (slider, value) applied by /stop and the watchdog, or None if there is none."""
         n = self._config.watchdog_slider
-        value = 0
+        if n == FALLBACK_AUTO:
+            heat = self._adapter.heat_slider()
+            if heat is None or not 0 <= heat < self._adapter.slider_count():
+                return None
+            return heat, self._adapter.slider_limits(heat)[0]
         if 0 <= n < self._adapter.slider_count():
             lo, hi = self._adapter.slider_limits(n)
-            value = int(min(max(self._config.watchdog_value, lo), hi))
-            c.expected[n] = value
-            c.last_write[n] = now
-        else:
-            n = -1
-        return pid_off, n, value
+            return n, int(min(max(self._config.watchdog_value, lo), hi))
+        return None
 
     def _apply_fallback(self, pid_off:bool, n:int, value:int) -> None:
         # PID off first, so a hardware PID does not override the fallback slider value
@@ -593,6 +612,11 @@ class AppAdapter:
         if self.aw.eventquantifieractive[n]:
             return {1: 10, 2: 5}.get(int(self.aw.eventquantifiercoarse[n]), 1)
         return 1
+
+    def heat_slider(self) -> int|None:
+        # the slider Artisan's PID drives as heat (pidPositiveTarget: 0 none, 1..4 sliders)
+        target = int(self.aw.pidcontrol.pidPositiveTarget)
+        return target - 1 if 1 <= target <= 4 else None
 
     def pid_info(self) -> dict[str, Any]:
         aw = self.aw

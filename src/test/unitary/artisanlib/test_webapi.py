@@ -12,7 +12,7 @@ from unittest.mock import Mock
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from artisanlib.webapi import WebAPI, WebAPIConfig, AppAdapter, MANUAL_OVERRIDE_GRACE
+from artisanlib.webapi import WebAPI, WebAPIConfig, AppAdapter, MANUAL_OVERRIDE_GRACE, FALLBACK_NONE
 
 
 class FakeAdapter:
@@ -29,6 +29,7 @@ class FakeAdapter:
                                     'mode': 'manual', 'source': 'BT', 'kind': 'kaleido'}
         self.sv_calls: list[float] = []
         self.pid_calls: list[bool] = []
+        self.heat: int|None = None
 
     def snapshot(self) -> dict[str, Any]:
         return {'bt': 200.0, 'sliders': list(self.values)}
@@ -44,6 +45,8 @@ class FakeAdapter:
         return self.steps[n]
     def slider_tolerance(self, n:int) -> int:
         return self.tolerances[n]
+    def heat_slider(self) -> int|None:
+        return self.heat
     def set_slider(self, n:int, value:int) -> None:
         self.set_calls.append((n, value))
         self.values[n] = value # the real adapter moves the slider asynchronously in the GUI thread
@@ -440,6 +443,39 @@ async def test_stop_locks_writes(adapter:FakeAdapter) -> None:
 
 
 @pytest.mark.asyncio
+async def test_stop_auto_fallback_uses_pid_heat_slider_minimum(adapter:FakeAdapter) -> None:
+    adapter.heat = 3
+    adapter.limits[3] = (10, 100)
+    api = WebAPI(adapter, WebAPIConfig()) # watchdog_slider defaults to auto
+    client = await make_client(api)
+    try:
+        state = await (await client.get('/api/v1/state')).json()
+        assert state['control']['fallback'] == {'slider': 3, 'value': 10}
+        data = await (await client.post('/api/v1/stop')).json()
+        assert data['actions'] == ['pid off', 'slider 3 = 10'] and 'warning' not in data
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_auto_fallback_without_heat_slider_warns(adapter:FakeAdapter) -> None:
+    client = await make_client(WebAPI(adapter, WebAPIConfig()))
+    try:
+        state = await (await client.get('/api/v1/state')).json()
+        assert state['control']['fallback'] is None
+        data = await (await client.post('/api/v1/stop')).json()
+        assert data['actions'] == ['pid off'] and 'only the PID' in data['warning']
+    finally:
+        await client.close()
+
+
+def test_explicit_fallback_overrides_auto(adapter:FakeAdapter) -> None:
+    adapter.heat = 3
+    assert WebAPI(adapter, WebAPIConfig(watchdog_slider=0, watchdog_value=150)).fallback() == (0, 100) # clamped
+    assert WebAPI(adapter, WebAPIConfig(watchdog_slider=FALLBACK_NONE)).fallback() is None
+
+
+@pytest.mark.asyncio
 async def test_stop_without_anything_configured_warns(adapter:FakeAdapter) -> None:
     adapter.pid['available'] = False
     client = await make_client(WebAPI(adapter, WebAPIConfig()))
@@ -574,6 +610,14 @@ def test_app_adapter_snapshot(aw:Mock) -> None:
     assert s['sliders'][2] == {'slider': 2, 'name': 'Damper', 'value': 30, 'min': 0, 'max': 9, 'step': 1, 'visible': True}
     assert s['pid'] == {'available': True, 'active': True, 'sv': 149.0, 'sv_min': 0.0, 'sv_max': 446.0,
                         'mode': 'manual', 'source': 'BT', 'kind': 'kaleido', 'sv_tolerance': 3.0}
+
+
+def test_app_adapter_heat_slider(aw:Mock) -> None:
+    a = AppAdapter(aw)
+    aw.pidcontrol.pidPositiveTarget = 4
+    assert a.heat_slider() == 3
+    aw.pidcontrol.pidPositiveTarget = 0
+    assert a.heat_slider() is None
 
 
 def test_app_adapter_slider_step_and_tolerance(aw:Mock) -> None:
