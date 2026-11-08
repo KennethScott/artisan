@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     from artisanlib.wheels import WheelDlg # pylint: disable=unused-import
     from artisanlib.hottop import Hottop # pylint: disable=unused-import
     from artisanlib.weblcds import WebLCDs, WebGreen, WebRoasted # pylint: disable=unused-import
+    from artisanlib.webapi import WebAPI # pylint: disable=unused-import
     from artisanlib.santoker import Santoker # pylint: disable=unused-import
     from artisanlib.santoker_r import SantokerR # pylint: disable=unused-import
     from artisanlib.lebrew import Lebrew_RoastSeeNEXT # pylint: disable=unused-import
@@ -1429,6 +1430,7 @@ class ApplicationWindow(QMainWindow):
         'recentThemeActs', 'applicationDirectory', 'helpdialog', 'redrawTimer', 'lastLoadedProfile', 'lastLoadedBackground', 'LargeScaleLCDsFlag', 'largeScaleLCDs_dialog',
         'analysisresultsanno', 'segmentresultsanno', 'schedule_window', 'scheduleFlag', 'scheduled_items_uuids', 'largeLCDs_dialog', 'LargeLCDsFlag', 'largeDeltaLCDs_dialog', 'LargeDeltaLCDsFlag', 'largePIDLCDs_dialog',
         'LargePIDLCDsFlag', 'largeExtraLCDs_dialog', 'LargeExtraLCDsFlag', 'largePhasesLCDs_dialog', 'LargePhasesLCDsFlag', 'WebLCDs', 'WebLCDsPort', 'weblcds_server',
+        'WebAPIActive', 'WebAPIPort', 'WebAPIToken', 'WebAPIMinInterval', 'WebAPIMaxStep', 'WebAPIWatchdogTimeout', 'WebAPIWatchdogSlider', 'WebAPIWatchdogValue', 'webapi_server',
         'weblcds_index_path', 'weblcds_websocket_path',
         'taskWebDisplayGreenActive', 'taskWebDisplayGreenPort', 'taskWebDisplayRoastedActive', 'taskWebDisplayRoastedPort',
         'taskWebDisplayGreen_server', 'taskWebDisplayRoasted_server',
@@ -1625,6 +1627,15 @@ class ApplicationWindow(QMainWindow):
         self.WebLCDs:bool = False
         self.WebLCDsPort:int = 8080
         self.WebLCDsAlerts:bool = False
+        # local control API (see artisanlib/webapi.py); always bound to 127.0.0.1
+        self.WebAPIActive:bool = False
+        self.WebAPIPort:int = 8081
+        self.WebAPIToken:str = ''
+        self.WebAPIMinInterval:float = 1.0
+        self.WebAPIMaxStep:int = 0
+        self.WebAPIWatchdogTimeout:float = 0.0
+        self.WebAPIWatchdogSlider:int = -1
+        self.WebAPIWatchdogValue:int = 0
 
         # Tasks Web Displays
         self.taskWebDisplayGreenActive:bool = False
@@ -1785,6 +1796,7 @@ class ApplicationWindow(QMainWindow):
         self.weblcds_index_path:Final[str] = 'artisan'
         self.weblcds_websocket_path:Final[str] = 'websocket'
         self.weblcds_server:WebLCDs|None = None # holds the WebLCD instance
+        self.webapi_server:WebAPI|None = None # holds the WebAPI instance
 
         # Hottop
         self.hottop:Hottop|None = None # holds the Hottop instance created on connect; reset to None on disconnect
@@ -19472,6 +19484,19 @@ class ApplicationWindow(QMainWindow):
             settings.endGroup()
 #--- END GROUP WebLCDs
 
+#--- BEGIN GROUP WebAPI
+            settings.beginGroup('WebAPI')
+            self.WebAPIActive = toBool(settings.value('active',self.WebAPIActive))
+            self.WebAPIPort = toInt(settings.value('port',self.WebAPIPort))
+            self.WebAPIToken = toString(settings.value('token',self.WebAPIToken))
+            self.WebAPIMinInterval = toFloat(settings.value('minInterval',self.WebAPIMinInterval))
+            self.WebAPIMaxStep = toInt(settings.value('maxStep',self.WebAPIMaxStep))
+            self.WebAPIWatchdogTimeout = toFloat(settings.value('watchdogTimeout',self.WebAPIWatchdogTimeout))
+            self.WebAPIWatchdogSlider = toInt(settings.value('watchdogSlider',self.WebAPIWatchdogSlider))
+            self.WebAPIWatchdogValue = toInt(settings.value('watchdogValue',self.WebAPIWatchdogValue))
+            settings.endGroup()
+#--- END GROUP WebAPI
+
 #--- BEGIN GROUP Tasks
             # Tasks
             settings.beginGroup('Tasks')
@@ -19574,6 +19599,9 @@ class ApplicationWindow(QMainWindow):
             # start WebLCD server if needed
             if self.WebLCDs:
                 QTimer.singleShot(2000, self.startWebLCDsforced)
+            # start local control API if needed
+            if self.WebAPIActive:
+                QTimer.singleShot(2002, self.startWebAPIforced)
             # start Task Green Web Display
             if self.taskWebDisplayGreenActive:
                 QTimer.singleShot(2001, self.startWebGreenforced)
@@ -19878,6 +19906,49 @@ class ApplicationWindow(QMainWindow):
                 self.weblcds_server.stopWeb()
             self.weblcds_server = None
             self.WebLCDs = False
+        except Exception as e: # pylint: disable=broad-except
+            _log.exception(e)
+
+    ## WebAPI
+
+    @pyqtSlot()
+    def startWebAPIforced(self) -> None:
+        self.startWebAPI(force=True)
+
+    def startWebAPI(self, force:bool = False) -> bool:
+        try:
+            if not self.app.artisanviewerMode and (not self.WebAPIActive or force):
+                from artisanlib.webapi import WebAPI, WebAPIConfig, AppAdapter
+                self.webapi_server = WebAPI(AppAdapter(self), WebAPIConfig(
+                    host='127.0.0.1',
+                    port=self.WebAPIPort,
+                    token=self.WebAPIToken,
+                    min_interval=self.WebAPIMinInterval,
+                    max_step=self.WebAPIMaxStep,
+                    watchdog_timeout=self.WebAPIWatchdogTimeout,
+                    watchdog_slider=self.WebAPIWatchdogSlider,
+                    watchdog_value=self.WebAPIWatchdogValue))
+                if self.webapi_server.start():
+                    self.WebAPIActive = True
+                    return True
+                self.stopWebAPI()
+            return False
+        except ModuleNotFoundError:
+            self.qmc.adderror(QApplication.translate('Error Message','Exception: WebAPI not supported by this build'))
+            self.stopWebAPI()
+            return False
+        except Exception as e: # pylint: disable=broad-except
+            _log.error(e)
+            self.qmc.adderror(QApplication.translate('Error Message','Could not start WebAPI. Selected port might be busy.'))
+            self.stopWebAPI()
+            return False
+
+    def stopWebAPI(self) -> None:
+        try:
+            if self.webapi_server is not None:
+                self.webapi_server.stop()
+            self.webapi_server = None
+            self.WebAPIActive = False
         except Exception as e: # pylint: disable=broad-except
             _log.exception(e)
 
@@ -21210,6 +21281,19 @@ class ApplicationWindow(QMainWindow):
             settings.endGroup()
 #--- END GROUP WebLCDs
 
+#--- BEGIN GROUP WebAPI
+            settings.beginGroup('WebAPI')
+            self.settingsSetValue(settings, default_settings, 'active',self.WebAPIActive, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'port',self.WebAPIPort, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'token',self.WebAPIToken, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'minInterval',self.WebAPIMinInterval, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'maxStep',self.WebAPIMaxStep, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'watchdogTimeout',self.WebAPIWatchdogTimeout, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'watchdogSlider',self.WebAPIWatchdogSlider, read_defaults)
+            self.settingsSetValue(settings, default_settings, 'watchdogValue',self.WebAPIWatchdogValue, read_defaults)
+            settings.endGroup()
+#--- END GROUP WebAPI
+
 #--- BEGIN GROUP Tasks
             # Tasks
             settings.beginGroup('Tasks')
@@ -21584,6 +21668,9 @@ class ApplicationWindow(QMainWindow):
         if self.WebLCDs:
             self.stopWebLCDs()
             self.WebLCDs = True # to ensure they are started again on restart
+        if self.WebAPIActive:
+            self.stopWebAPI()
+            self.WebAPIActive = True # to ensure it is started again on restart
         if self.taskWebDisplayGreenActive:
             self.stopWebGreen()
             self.taskWebDisplayGreenActive = True # to ensure they are started again on restart

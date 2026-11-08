@@ -5258,6 +5258,9 @@ class tgraphcanvas(QObject):
             # LargeLCDs and WebLCDs
             if self.aw.WebLCDs:
                 self.updateWebLCDs(bt=btstr,et=etstr,time=timestr)
+            # wake WebAPI long-poll waiters
+            if self.aw.webapi_server is not None:
+                self.aw.webapi_server.notify_sample()
             try:
                 if timestr is None:
                     self.updateLargeLCDsReadingsSignal.emit(btstr,etstr)

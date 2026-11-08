@@ -1446,6 +1446,39 @@ class CurvesDlg(ArtisanDialog):
         WebLCDsGroupWidget = QGroupBox(QApplication.translate('GroupBox','WebLCDs'))
         WebLCDsGroupWidget.setLayout(WebLCDsVLayout)
 
+        # local control API
+        self.WebAPIFlag = QCheckBox()
+        self.WebAPIFlag.setChecked(self.aw.WebAPIActive)
+        self.WebAPIFlag.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.WebAPIFlag.clicked.connect(self.toggleWebAPI)
+        WebAPIPortLabel = QLabel(QApplication.translate('Label', 'Port'))
+        self.WebAPIPort = QLineEdit(str(self.aw.WebAPIPort))
+        self.WebAPIPort.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.WebAPIPort.setValidator(QRegularExpressionValidator(QRegularExpression(r'^[0-9]{1,5}$'),self))
+        self.WebAPIPort.setMaximumWidth(55)
+        self.WebAPIPort.setDisabled(self.aw.WebAPIActive)
+        WebAPITokenLabel = QLabel(QApplication.translate('Label', 'Token'))
+        self.WebAPIToken = QLineEdit(self.aw.WebAPIToken)
+        self.WebAPIToken.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
+        self.WebAPIToken.setDisabled(self.aw.WebAPIActive)
+        self.WebAPIURL = QLabel(f'http://127.0.0.1:{self.aw.WebAPIPort}/api/v1/state' if self.aw.WebAPIActive else '')
+        self.WebAPIURL.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        WebAPILayout = QHBoxLayout()
+        WebAPILayout.addWidget(self.WebAPIFlag)
+        WebAPILayout.addWidget(WebAPIPortLabel)
+        WebAPILayout.addWidget(self.WebAPIPort)
+        WebAPILayout.addWidget(WebAPITokenLabel)
+        WebAPILayout.addWidget(self.WebAPIToken)
+        WebAPIVLayout = QVBoxLayout()
+        if not self.app.artisanviewerMode:
+            WebAPIVLayout.addLayout(WebAPILayout)
+            WebAPIVLayout.addWidget(self.WebAPIURL)
+        else:
+            WebAPIVLayout.addWidget(QLabel(QApplication.translate('Label', 'Not available in ArtisanViewer')))
+        WebAPIVLayout.addStretch()
+        WebAPIGroupWidget = QGroupBox(QApplication.translate('GroupBox','Local Control API'))
+        WebAPIGroupWidget.setLayout(WebAPIVLayout)
+
         # Renaming BT and ET
         self.renameETLabel = QLabel(QApplication.translate('Label', 'ET'))
         self.renameETLine = QLineEdit(self.aw.ETname)
@@ -1512,8 +1545,9 @@ class CurvesDlg(ArtisanDialog):
         renlogLayout = QVBoxLayout()
         renlogLayout.addWidget(renameGroupWidget)
         renlogLayout.addWidget(logofileGroupWidget)
-        webLayout = QHBoxLayout()
+        webLayout = QVBoxLayout()
         webLayout.addWidget(WebLCDsGroupWidget)
+        webLayout.addWidget(WebAPIGroupWidget)
         webrenlogLayout = QHBoxLayout()
         webrenlogLayout.addLayout(renlogLayout)
         webrenlogLayout.addLayout(webLayout)
@@ -1751,6 +1785,25 @@ class CurvesDlg(ArtisanDialog):
             host = socket.gethostname()
         return f"http://{host.strip().replace(' ', '_').casefold()}.local:{str(self.aw.WebLCDsPort)}/{self.aw.weblcds_index_path}"
 
+
+    @pyqtSlot(bool)
+    def toggleWebAPI(self, b:bool = False) -> None:
+        res = False
+        if b:
+            try:
+                if self.WebAPIPort.text():
+                    self.aw.WebAPIPort = int(self.WebAPIPort.text())
+                self.aw.WebAPIToken = self.WebAPIToken.text().strip()
+                res = self.aw.startWebAPI()
+            except Exception as e: # pylint: disable=broad-except
+                self.aw.sendmessage(str(e))
+                res = False
+        else:
+            self.aw.stopWebAPI()
+        self.WebAPIFlag.setChecked(res)
+        self.WebAPIPort.setDisabled(res)
+        self.WebAPIToken.setDisabled(res)
+        self.WebAPIURL.setText(f'http://127.0.0.1:{self.aw.WebAPIPort}/api/v1/state' if res else '')
 
     @pyqtSlot(bool)
     def toggleWebLCDs(self, b:bool = False) -> None:
