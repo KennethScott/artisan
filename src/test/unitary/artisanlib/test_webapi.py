@@ -278,6 +278,26 @@ def test_app_adapter_snapshot(aw:Mock) -> None:
     assert s['sliders'][2] == {'slider': 2, 'name': 'Damper', 'value': 30, 'min': 0, 'max': 9, 'visible': True}
 
 
+def test_app_adapter_snapshot_monitoring_only(aw:Mock) -> None:
+    aw.qmc.flagstart = False
+    aw.qmc.on_timex = [10.0, 11.0, 12.0]
+    aw.qmc.on_temp1 = [400.0, 401.0, 402.0]
+    aw.qmc.on_temp2 = [300.0, 301.0, 302.0]
+    s = AppAdapter(aw).snapshot()
+    assert not s['recording'] and not s['charged']
+    assert s['time'] is None # rolling monitor buffer has no meaningful roast time
+    assert s['bt'] == 302.0 and s['et'] == 402.0
+    assert s['events'] == {}
+
+
+def test_app_adapter_background_is_charge_relative(aw:Mock) -> None:
+    aw.qmc.background = True
+    aw.qmc.backgroundSmoothedBTat.return_value = 222.04
+    s = AppAdapter(aw).snapshot()
+    assert s['bt_background'] == 222.0
+    aw.qmc.backgroundSmoothedBTat.assert_called_once_with(3.0, relative=True)
+
+
 def test_app_adapter_writes(aw:Mock) -> None:
     a = AppAdapter(aw)
     a.set_slider(3, 55)

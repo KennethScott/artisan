@@ -469,7 +469,9 @@ class AppAdapter:
             'monitoring': bool(qmc.flagon),
             'recording': recording,
             'charged': charged,
-            'time': round(timex[length - 1] - t0, 1) if length else None,
+            # roast time: since CHARGE, or since START before CHARGE; None while only monitoring
+            # (the on_* buffers are a rolling window, so their span is meaningless)
+            'time': round(timex[length - 1] - t0, 1) if recording and length else None,
             'bt': self._r(temp2[length - 1]) if length else None,
             'et': self._r(temp1[length - 1]) if length else None,
             'bt_ror': self._r(qmc.rateofchange2),
@@ -478,7 +480,8 @@ class AppAdapter:
         }
         if charged and qmc.background and length:
             with suppress(Exception):
-                state['bt_background'] = self._r(qmc.backgroundSmoothedBTat(timex[length - 1] - t0))
+                # relative=True: align to the background's own CHARGE, not its file start
+                state['bt_background'] = self._r(qmc.backgroundSmoothedBTat(timex[length - 1] - t0, relative=True))
 
         events:dict[str, Any] = {}
         if recording:
