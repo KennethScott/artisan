@@ -37,7 +37,8 @@ Endpoints (all JSON):
   POST /api/v1/sv       {"value": n}          PID set value (manual SV mode only)
   POST /api/v1/pid      {"on": true|false}    PID on/off ("off" is always accepted)
   POST /api/v1/event    {"event": "CHARGE"|"DRY"|"FCs"|"FCe"|"SCs"|"SCe"|"DROP"|"COOL"}
-  POST /api/v1/release  clears a manual-override or watchdog lock
+  POST /api/v1/stop     emergency stop: PID off + fallback slider value, then locked (always accepted)
+  POST /api/v1/release  clears a manual-override, watchdog or stop lock
 
 Safety:
   * binds to 127.0.0.1 by default
@@ -106,8 +107,8 @@ class WebAPIConfig:
     max_step: int = 0               # maximum slider change per write (0: unlimited)
     max_sv_step: float = 0.0        # maximum SV change per write, in temperature units (0: unlimited)
     watchdog_timeout: float = 0.0   # seconds without any request before the watchdog trips (0: off)
-    watchdog_slider: int = -1       # slider to set on trip (-1: just hold and lock)
-    watchdog_value: int = 0         # value applied to watchdog_slider on trip
+    watchdog_slider: int = -1       # fallback slider set on watchdog trip and on /stop, typically heat (-1: none)
+    watchdog_value: int = 0         # value applied to watchdog_slider
     watchdog_pid_off: bool = False  # switch the PID off on trip
 
 
@@ -123,6 +124,7 @@ class ControlState:
     override_reason: str = ''
     watchdog_armed: bool = False
     watchdog_tripped: bool = False
+    stopped: bool = False           # set by /stop until /release
     last_seen: float = field(default_factory=time.monotonic)
     active_waits: int = 0
 
@@ -152,6 +154,7 @@ class WebAPI:
             web.post('/api/v1/sv', self.handle_sv),
             web.post('/api/v1/pid', self.handle_pid),
             web.post('/api/v1/event', self.handle_event),
+            web.post('/api/v1/stop', self.handle_stop),
             web.post('/api/v1/release', self.handle_release),
         ])
         app.on_startup.append(self._on_startup)
@@ -201,6 +204,7 @@ class WebAPI:
                 'watchdog_armed': self._control.watchdog_armed,
                 'watchdog_tripped': self._control.watchdog_tripped,
                 'watchdog_timeout': self._config.watchdog_timeout,
+                'stopped': self._control.stopped,
             }
 
     def _state(self) -> dict[str, Any]:
@@ -233,7 +237,7 @@ class WebAPI:
                     sv = pid.get('sv')
                     if pid.get('mode') != 'manual':
                         reason = f"SV mode changed to {pid.get('mode')}"
-                    elif sv is None or abs(sv - c.expected_sv) >= SV_TOLERANCE:
+                    elif sv is None or abs(sv - c.expected_sv) >= float(pid.get('sv_tolerance', SV_TOLERANCE)):
                         reason = f'SV changed externally ({c.expected_sv} -> {sv})'
                 if not reason and c.expected_pid is not None and now - (c.last_pid_write or 0.0) >= MANUAL_OVERRIDE_GRACE:
                     active = bool(pid.get('active'))
@@ -246,6 +250,8 @@ class WebAPI:
 
     def _write_lock_error(self) -> web.Response|None:
         """Returns an error response if writes are currently locked. Call with self._lock held."""
+        if self._control.stopped:
+            return self._error(409, 'stopped; POST /api/v1/release to resume')
         if self._control.watchdog_tripped:
             return self._error(409, 'watchdog tripped; POST /api/v1/release to resume')
         if self._control.override:
@@ -412,11 +418,27 @@ class WebAPI:
         self._adapter.mark_event(name)
         return self._json({'event': name})
 
+    async def handle_stop(self, _request:web.Request) -> web.Response:
+        """Emergency stop: PID off and the fallback slider value applied (e.g. heat to 0),
+        then all writes locked until /release. Always accepted."""
+        with self._lock:
+            self._control.stopped = True
+            plan = self._plan_fallback(bool(self._adapter.pid_info().get('available')))
+        _log.warning('WebAPI stop requested')
+        self._apply_fallback(*plan)
+        pid_off, n, value = plan
+        actions = (['pid off'] if pid_off else []) + ([f'slider {n} = {value}'] if n >= 0 else [])
+        result:dict[str, Any] = {'actions': actions, 'control': self._control_info()}
+        if not actions:
+            result['warning'] = 'no PID and no fallback slider configured; writes locked but nothing was changed'
+        return self._json(result)
+
     async def handle_release(self, _request:web.Request) -> web.Response:
         with self._lock:
             self._control.override = False
             self._control.override_reason = ''
             self._control.watchdog_tripped = False
+            self._control.stopped = False
             # re-baseline expectations against the current slider positions / PID state
             for n in list(self._control.expected):
                 self._control.expected[n] = self._adapter.slider_value(n)
@@ -444,25 +466,36 @@ class WebAPI:
             if time.monotonic() - c.last_seen < self._config.watchdog_timeout:
                 return False
             c.watchdog_tripped = True
-            n = self._config.watchdog_slider
-            value = 0
-            pid_off = self._config.watchdog_pid_off and bool(self._adapter.pid_info().get('active'))
-            if pid_off:
-                c.expected_pid = False
-                c.last_pid_write = time.monotonic()
-            apply_fallback = 0 <= n < self._adapter.slider_count()
-            if apply_fallback:
-                lo, hi = self._adapter.slider_limits(n)
-                value = int(min(max(self._config.watchdog_value, lo), hi))
-                c.expected[n] = value
-                c.last_write[n] = time.monotonic()
+            plan = self._plan_fallback(self._config.watchdog_pid_off and bool(self._adapter.pid_info().get('active')))
         _log.warning('WebAPI watchdog tripped after %ss without requests', self._config.watchdog_timeout)
+        self._apply_fallback(*plan)
+        return True
+
+    def _plan_fallback(self, pid_off:bool) -> tuple[bool, int, int]:
+        """Records the fallback (PID off, fallback slider value) as the expected state so it is
+        not mistaken for a manual override. Call with self._lock held; then call _apply_fallback."""
+        c = self._control
+        now = time.monotonic()
+        if pid_off:
+            c.expected_pid = False
+            c.last_pid_write = now
+        n = self._config.watchdog_slider
+        value = 0
+        if 0 <= n < self._adapter.slider_count():
+            lo, hi = self._adapter.slider_limits(n)
+            value = int(min(max(self._config.watchdog_value, lo), hi))
+            c.expected[n] = value
+            c.last_write[n] = now
+        else:
+            n = -1
+        return pid_off, n, value
+
+    def _apply_fallback(self, pid_off:bool, n:int, value:int) -> None:
         # PID off first, so a hardware PID does not override the fallback slider value
         if pid_off:
             self._adapter.set_pid(False)
-        if apply_fallback:
+        if n >= 0:
             self._adapter.set_slider(n, value)
-        return True
 
     async def _watchdog_loop(self) -> None:
         while True:
@@ -569,6 +602,10 @@ class AppAdapter:
         available = aw.qmc.device != 0 and (external in {1, 2, 3} or bool(aw.qmc.Controlbuttonflag))
         mode = SV_MODES[pc.svMode] if 0 <= pc.svMode < len(SV_MODES) else str(pc.svMode)
         source = {1: 'BT', 2: 'ET'}.get(pc.pidSource, 'extra')
+        kind = ('software', 'modbus', 's7', 'tc4', 'kaleido')[external] if 0 <= external <= 4 else 'unknown'
+        # The Kaleido keeps its target in whole degrees C and Artisan syncs the SV back from the
+        # machine, rounded to whole display units; a requested SV can settle up to ~1C lower.
+        sv_tolerance = (3.0 if aw.qmc.mode == 'F' else 1.5) if kind == 'kaleido' else SV_TOLERANCE
         return {
             'available': available,
             'active': bool(pc.pidActive),
@@ -577,7 +614,8 @@ class AppAdapter:
             'sv_max': float(pc.svSliderMax),
             'mode': mode,
             'source': source,
-            'kind': ('software', 'modbus', 's7', 'tc4', 'kaleido')[external] if 0 <= external <= 4 else 'unknown',
+            'kind': kind,
+            'sv_tolerance': sv_tolerance,
         }
 
     def set_sv(self, value:float) -> None:

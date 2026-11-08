@@ -387,6 +387,71 @@ async def test_sv_external_change_engages_override(adapter:FakeAdapter) -> None:
 
 
 @pytest.mark.asyncio
+async def test_sv_tolerance_from_pid_info(adapter:FakeAdapter) -> None:
+    adapter.pid['sv_tolerance'] = 3.0 # e.g. Kaleido: machine keeps whole degrees C
+    api = WebAPI(adapter, WebAPIConfig(min_interval=0))
+    client = await make_client(api)
+    try:
+        assert (await client.post('/api/v1/sv', json={'value': 155})).status == 200
+        _age_writes(api)
+        adapter.pid['sv'] = 153.0 # machine settled on 67C
+        assert (await (await client.get('/api/v1/state')).json())['control']['override'] is False
+        adapter.pid['sv'] = 140.0
+        assert (await (await client.get('/api/v1/state')).json())['control']['override'] is True
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_applies_fallback_even_when_locked(adapter:FakeAdapter) -> None:
+    adapter.values[3] = 80
+    api = WebAPI(adapter, WebAPIConfig(min_interval=0, watchdog_slider=3, watchdog_value=0))
+    client = await make_client(api)
+    try:
+        assert (await client.post('/api/v1/pid', json={'on': True})).status == 200
+        assert (await client.post('/api/v1/slider', json={'slider': 0, 'value': 50})).status == 200
+        _age_writes(api)
+        adapter.values[0] = 20 # user took over: API is locked
+        assert (await client.post('/api/v1/slider', json={'slider': 0, 'value': 55})).status == 409
+        data = await (await client.post('/api/v1/stop')).json()
+        assert data['actions'] == ['pid off', 'slider 3 = 0']
+        assert data['control']['stopped'] is True
+        assert adapter.pid_calls[-1] is False and adapter.set_calls[-1] == (3, 0)
+        # everything stays locked, also after the override is gone, until release
+        assert (await client.post('/api/v1/release')).status == 200
+        assert (await (await client.get('/api/v1/state')).json())['control']['stopped'] is False
+        assert (await client.post('/api/v1/slider', json={'slider': 0, 'value': 55})).status == 200
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_locks_writes(adapter:FakeAdapter) -> None:
+    client = await make_client(WebAPI(adapter, WebAPIConfig(min_interval=0, watchdog_slider=3)))
+    try:
+        assert (await client.post('/api/v1/stop')).status == 200
+        resp = await client.post('/api/v1/sv', json={'value': 300})
+        assert resp.status == 409 and 'stopped' in (await resp.json())['error']
+        assert (await client.post('/api/v1/pid', json={'on': True})).status == 409
+        assert (await client.post('/api/v1/pid', json={'on': False})).status == 200 # off still fine
+        assert (await client.post('/api/v1/stop')).status == 200 # stop is idempotent
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_without_anything_configured_warns(adapter:FakeAdapter) -> None:
+    adapter.pid['available'] = False
+    client = await make_client(WebAPI(adapter, WebAPIConfig()))
+    try:
+        data = await (await client.post('/api/v1/stop')).json()
+        assert data['actions'] == [] and 'warning' in data
+        assert not adapter.set_calls and not adapter.pid_calls
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_sv_mode_switch_engages_override(adapter:FakeAdapter) -> None:
     api = WebAPI(adapter, WebAPIConfig(min_interval=0))
     client = await make_client(api)
@@ -508,7 +573,7 @@ def test_app_adapter_snapshot(aw:Mock) -> None:
     assert s['events']['DRY'] is None
     assert s['sliders'][2] == {'slider': 2, 'name': 'Damper', 'value': 30, 'min': 0, 'max': 9, 'step': 1, 'visible': True}
     assert s['pid'] == {'available': True, 'active': True, 'sv': 149.0, 'sv_min': 0.0, 'sv_max': 446.0,
-                        'mode': 'manual', 'source': 'BT', 'kind': 'kaleido'}
+                        'mode': 'manual', 'source': 'BT', 'kind': 'kaleido', 'sv_tolerance': 3.0}
 
 
 def test_app_adapter_slider_step_and_tolerance(aw:Mock) -> None:
@@ -529,6 +594,12 @@ def test_app_adapter_pid_availability(aw:Mock) -> None:
     aw.pidcontrol.svMode = 2
     aw.pidcontrol.sv = None
     assert a.pid_info()['mode'] == 'background' and a.pid_info()['sv'] is None
+    assert a.pid_info()['sv_tolerance'] == 0.5 # only the Kaleido gets the whole-degree-C allowance
+
+
+def test_app_adapter_kaleido_sv_tolerance_celsius(aw:Mock) -> None:
+    aw.qmc.mode = 'C'
+    assert AppAdapter(aw).pid_info()['sv_tolerance'] == 1.5
 
 
 def test_app_adapter_snapshot_monitoring_only(aw:Mock) -> None:
