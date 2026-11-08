@@ -1469,6 +1469,12 @@ class CurvesDlg(ArtisanDialog):
         WebAPILayout.addWidget(self.WebAPIPort)
         WebAPILayout.addWidget(WebAPITokenLabel)
         WebAPILayout.addWidget(self.WebAPIToken)
+        self.WebAPISettingsButton = QPushButton(QApplication.translate('Button', 'Settings...'))
+        self.WebAPISettingsButton.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.WebAPISettingsButton.setToolTip(QApplication.translate('Tooltip', 'Write limits and safety settings; only while the API is off'))
+        self.WebAPISettingsButton.setDisabled(self.aw.WebAPIActive)
+        self.WebAPISettingsButton.clicked.connect(self.openWebAPISettings)
+        WebAPILayout.addWidget(self.WebAPISettingsButton)
         WebAPIVLayout = QVBoxLayout()
         if not self.app.artisanviewerMode:
             WebAPIVLayout.addLayout(WebAPILayout)
@@ -1803,7 +1809,14 @@ class CurvesDlg(ArtisanDialog):
         self.WebAPIFlag.setChecked(res)
         self.WebAPIPort.setDisabled(res)
         self.WebAPIToken.setDisabled(res)
+        self.WebAPISettingsButton.setDisabled(res)
         self.WebAPIURL.setText(f'http://127.0.0.1:{self.aw.WebAPIPort}/api/v1/state' if res else '')
+
+    @pyqtSlot(bool)
+    def openWebAPISettings(self, _:bool = False) -> None:
+        from artisanlib.webapi_dialog import WebAPISettingsDlg
+        dialog = WebAPISettingsDlg(self, self.aw)
+        dialog.exec()
 
     @pyqtSlot(bool)
     def toggleWebLCDs(self, b:bool = False) -> None:
