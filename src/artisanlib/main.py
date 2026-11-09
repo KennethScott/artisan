@@ -19938,6 +19938,8 @@ class ApplicationWindow(QMainWindow):
 
     def startWebAPI(self, force:bool = False) -> bool:
         try:
+            if self.webapi_server is not None:
+                return True # already running; a second server would orphan the first
             if not self.app.artisanviewerMode and (not self.WebAPIActive or force):
                 from artisanlib.webapi import WebAPI, WebAPIConfig, AppAdapter
                 self.webapi_server = WebAPI(AppAdapter(self), WebAPIConfig(
