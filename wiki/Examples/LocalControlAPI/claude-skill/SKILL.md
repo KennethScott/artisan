@@ -53,8 +53,14 @@ or `control.stopped` becomes true, or at DROP.
 
 1. `GET /state` once: unit, recording, background loaded and its title, `pid.available` and `pid.mode`,
    `control.fallback` (null means `/stop` cannot cut heat: tell the user).
-2. Repeat `GET /wait?timeout=30&until=event`: one short line per tick (time, BT, RoR, gap to target, SV and PID
-   state, new events), then decide: no change / suggest / act.
+2. During the roast run the bundled watcher (adjust the paths):
+   `python ~/.claude/skills/artisan-roaster/watch.py --dur 60 --every 15`
+   It prints one compact line per interval and returns early when a decision is needed. Exit codes: 0 duration
+   elapsed · 10 new event · 11 lock/override/stop · 12 it called `/stop` itself because BT exceeded `--limit`
+   (default 420 °F / 215 °C) · 13 API unreachable · 14 not recording. After each run: one short line to the user,
+   act if needed (one write), run it again. Use `--dur 30` around events, `--dur 60` in steady phases.
+3. Hard limits live in Artisan and the watcher, not in your reaction time. Keep in-roast reasoning short; plan
+   targets before the roast and review after. A faster output mode helps more than a smaller model.
 
 ## Rules
 

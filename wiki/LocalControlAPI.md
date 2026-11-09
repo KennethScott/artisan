@@ -172,7 +172,9 @@ curl -s -X POST http://127.0.0.1:8081/api/v1/stop
 More in [Examples/LocalControlAPI](Examples/LocalControlAPI):
 
 * `monitor.py`: a dependency-free Python monitor that prints one line per sample interval and per event.
-* `claude-skill/SKILL.md`: a template for using the API with Claude Code as a roast monitor, coach or controller.
+* `claude-skill/`: a template for using the API with Claude Code as a roast monitor, coach or controller, with a
+  watcher script (`watch.py`) that streams compact status lines, returns when a decision is needed, and calls
+  `/stop` on its own if BT exceeds a limit.
 
 
 ### Notes from testing on a Kaleido M2
