@@ -279,6 +279,33 @@ async def test_watchdog_trips_applies_fallback_and_locks(adapter:FakeAdapter) ->
         await client.close()
 
 
+def test_stop_ends_pending_wait_cleanly(adapter:FakeAdapter, caplog:pytest.LogCaptureFixture) -> None:
+    import json
+    import socket
+    import threading
+    import urllib.request
+    with socket.socket() as s: # a free port
+        s.bind(('127.0.0.1', 0))
+        port = s.getsockname()[1]
+    api = WebAPI(adapter, WebAPIConfig(port=port))
+    api.start()
+    result:dict[str, Any] = {}
+    def client() -> None:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/v1/wait?timeout=30', timeout=10) as r:
+            result.update(json.loads(r.read()))
+    t = threading.Thread(target=client)
+    t.start()
+    deadline = time.monotonic() + 5
+    while api._control.active_waits == 0 and time.monotonic() < deadline: # pylint: disable=protected-access
+        time.sleep(0.02)
+    started = time.monotonic()
+    api.stop()
+    t.join(5)
+    assert result.get('reason') == 'shutdown'
+    assert time.monotonic() - started < 3
+    assert not [r for r in caplog.records if r.levelname == 'ERROR']
+
+
 def test_watchdog_not_armed_without_recording(adapter:FakeAdapter) -> None:
     api = WebAPI(adapter, WebAPIConfig(watchdog_timeout=1))
     api._control.last_seen = time.monotonic() - 10 # pylint: disable=protected-access

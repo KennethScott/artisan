@@ -162,6 +162,7 @@ class WebAPI:
         self._runner: web.AppRunner|None = None
         self._sample_event: asyncio.Event|None = None
         self._watchdog_task: asyncio.Task[None]|None = None
+        self._closing = False # set on stop() to end pending long-polls before the server shuts down
         self.app = self.create_app()
 
     # ---------------------------------------------------------------- app
@@ -339,6 +340,9 @@ class WebAPI:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
+                if self._closing:
+                    reason = 'shutdown'
+                    break
                 event = self._sample_event
                 if event is None:
                     await asyncio.sleep(min(remaining, 1.0))
@@ -346,6 +350,9 @@ class WebAPI:
                 try:
                     await asyncio.wait_for(event.wait(), remaining)
                 except TimeoutError:
+                    break
+                if self._closing:
+                    reason = 'shutdown'
                     break
                 if self._adapter.event_signature() != start_sig:
                     reason = 'event'
@@ -691,6 +698,16 @@ class WebAPI:
         _log.info('stop WebAPI')
         loop = self._loop
         if loop is not None:
+            # end pending long-polls first; aiohttp's shutdown does not cope well with handlers still waiting
+            self._closing = True
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._pulse)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                with self._lock:
+                    if self._control.active_waits == 0:
+                        break
+                time.sleep(0.02)
             if self._runner is not None:
                 with suppress(Exception):
                     asyncio.run_coroutine_threadsafe(self._runner.cleanup(), loop).result(2)
