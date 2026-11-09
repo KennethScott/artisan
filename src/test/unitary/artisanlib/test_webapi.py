@@ -30,7 +30,8 @@ class FakeAdapter:
         self.sv_calls: list[float] = []
         self.pid_calls: list[bool] = []
         self.heat: int|None = None
-        self.bg: dict[str, Any] = {'loaded': True, 'title': 'ref', 'charged': True, 'shift_temp': 0, 'shift_time': 0}
+        self.bg: dict[str, Any] = {'loaded': True, 'title': 'ref', 'charged': True, 'shift_temp': 0, 'shift_time': 0, 'unit': 'F'}
+        self.targets: tuple[float, float|None]|None = None
         self.mode_calls: list[str] = []
         self.lookahead_calls: list[int] = []
         self.calls: list[str] = [] # order of PID-related calls
@@ -72,6 +73,9 @@ class FakeAdapter:
         self.calls.append(f'lookahead {seconds}')
     def background_info(self) -> dict[str, Any]:
         return dict(self.bg)
+    def background_targets(self, time_s:int) -> tuple[float, float|None]|None:
+        del time_s
+        return self.targets
     def shift_background(self, temp:int, time_s:int) -> None:
         self.bg['shift_temp'] += temp
         self.bg['shift_time'] += time_s
@@ -505,6 +509,25 @@ async def test_stop_without_anything_configured_warns(adapter:FakeAdapter) -> No
 
 
 @pytest.mark.asyncio
+async def test_pid_owns_heat_slider_while_active(adapter:FakeAdapter) -> None:
+    adapter.heat = 3
+    api = WebAPI(adapter, WebAPIConfig(min_interval=0))
+    client = await make_client(api)
+    try:
+        assert (await client.post('/api/v1/stop')).status == 200 # sets heat slider 3 = 0 and tracks it
+        assert (await client.post('/api/v1/release')).status == 200
+        assert (await client.post('/api/v1/pid', json={'on': True})).status == 200
+        _age_writes(api)
+        adapter.values[3] = 70 # the PID drives the heat slider
+        assert (await (await client.get('/api/v1/state')).json())['control']['override'] is False
+        resp = await client.post('/api/v1/slider', json={'slider': 3, 'value': 20})
+        assert resp.status == 409 and 'driven by the active PID' in (await resp.json())['error']
+        assert (await client.post('/api/v1/slider', json={'slider': 0, 'value': 20})).status == 200 # others fine
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_pid_mode_and_lookahead(adapter:FakeAdapter) -> None:
     client = await make_client(WebAPI(adapter, WebAPIConfig(min_interval=0)))
     try:
@@ -582,6 +605,40 @@ async def test_background_shift(adapter:FakeAdapter) -> None:
         assert api._control.expected_shift == (0, -30) # pylint: disable=protected-access
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_background_shift_refuses_target_jumps(adapter:FakeAdapter) -> None:
+    client = await make_client(WebAPI(adapter, WebAPIConfig(min_interval=0))) # no max_sv_step: default 20F
+    try:
+        assert (await client.post('/api/v1/background', json={'shift_temp': 25})).status == 422
+        # moving the curve 30 s later lands before the background's CHARGE (seen in the simulator: 233 -> 348)
+        adapter.targets = (233.0, 348.0)
+        resp = await client.post('/api/v1/background', json={'shift_time': 30})
+        assert resp.status == 422 and '233.0 to 348.0' in (await resp.json())['error']
+        adapter.targets = (233.0, None)
+        assert (await client.post('/api/v1/background', json={'shift_time': 30})).status == 422
+        # small, smooth moves pass; temp and time combine
+        adapter.targets = (233.0, 228.0)
+        assert (await client.post('/api/v1/background', json={'shift_time': 10, 'shift_temp': 5})).status == 200
+        adapter.targets = None # no current target (e.g. before CHARGE): only the temp limit applies
+        assert (await client.post('/api/v1/background', json={'shift_time': 60})).status == 200
+        assert adapter.bg['shift_time'] == 70
+    finally:
+        await client.close()
+
+
+def test_app_adapter_background_targets(aw:Mock) -> None:
+    aw.qmc.flagstart = True
+    aw.qmc.timeindex = [1, 0, 0, 0, 0, 0, 0, 0]
+    aw.qmc.timex = [0.0, 10.0, 20.0]
+    aw.pidcontrol.svLookahead = 5
+    aw.qmc.backgroundSmoothedBTat.side_effect = lambda t: {25.0: 300.0, -5.0: -1}.get(t, 250.0)
+    a = AppAdapter(aw)
+    assert a.background_targets(10) == (300.0, 250.0) # looks up 20 + 5 and 25 - 10
+    assert a.background_targets(30) == (300.0, None) # before the background data starts
+    aw.qmc.timeindex = [-1, 0, 0, 0, 0, 0, 0, 0]
+    assert a.background_targets(10) is None # not charged
 
 
 @pytest.mark.asyncio
@@ -713,10 +770,10 @@ def test_app_adapter_snapshot(aw:Mock) -> None:
     assert s['sliders'][2] == {'slider': 2, 'name': 'Damper', 'value': 30, 'min': 0, 'max': 9, 'step': 1, 'visible': True}
     assert s['pid'] == {'available': True, 'active': True, 'sv': 149.0, 'sv_min': 0.0, 'sv_max': 446.0,
                         'mode': 'manual', 'source': 'BT', 'kind': 'kaleido', 'sv_tolerance': 3.0, 'lookahead': 4}
-    assert s['background'] == {'loaded': False, 'title': None, 'charged': False, 'shift_temp': 5, 'shift_time': -10} # hidden
+    assert s['background'] == {'loaded': False, 'title': None, 'charged': False, 'shift_temp': 5, 'shift_time': -10, 'unit': 'F'} # hidden
     aw.qmc.background = True
     assert AppAdapter(aw).snapshot()['background'] == {'loaded': True, 'title': 'Colombia v1', 'charged': True,
-                                                       'shift_temp': 5, 'shift_time': -10}
+                                                       'shift_temp': 5, 'shift_time': -10, 'unit': 'F'}
 
 
 def test_app_adapter_heat_slider(aw:Mock) -> None:

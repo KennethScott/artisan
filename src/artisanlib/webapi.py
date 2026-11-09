@@ -84,6 +84,8 @@ SV_MODES: Final[tuple[str, ...]] = ('manual', 'ramp_soak', 'background')
 SETTABLE_SV_MODES: Final[tuple[str, ...]] = ('manual', 'background') # ramp/soak needs a program set up in the PID dialog
 MAX_LOOKAHEAD: Final[int] = 60 # seconds
 MAX_BACKGROUND_TIME_SHIFT: Final[int] = 120 # seconds per request
+# largest PID target change one background move may cause if max_sv_step is not set (F / C)
+DEFAULT_MAX_TARGET_JUMP: Final[dict[str, float]] = {'F': 20.0, 'C': 11.0}
 FALLBACK_NONE: Final[int] = -1  # watchdog_slider: no fallback slider
 FALLBACK_AUTO: Final[int] = -2  # watchdog_slider: the PID's heat slider (positive target), set to its minimum
 
@@ -106,6 +108,7 @@ class ArtisanAdapter(Protocol):
     def set_pid_mode(self, mode:str) -> None: ...
     def set_pid_lookahead(self, seconds:int) -> None: ...
     def background_info(self) -> dict[str, Any]: ...
+    def background_targets(self, time_s:int) -> tuple[float, float|None]|None: ...
     def shift_background(self, temp:int, time_s:int) -> None: ...
     def is_recording(self) -> bool: ...
     def mark_event(self, name:str) -> None: ...
@@ -244,8 +247,9 @@ class WebAPI:
             if c.override:
                 return
             reason = ''
+            pid_slider = self._pid_driven_slider()
             for n, expected in c.expected.items():
-                if now - c.last_write.get(n, 0.0) < MANUAL_OVERRIDE_GRACE:
+                if now - c.last_write.get(n, 0.0) < MANUAL_OVERRIDE_GRACE or n == pid_slider:
                     continue
                 actual = self._adapter.slider_value(n)
                 # a quantifier rounds machine readings to its step; smaller differences are not a takeover
@@ -277,6 +281,13 @@ class WebAPI:
                 c.override = True
                 c.override_reason = reason
                 _log.info('WebAPI manual override: %s', reason)
+
+    def _pid_driven_slider(self) -> int|None:
+        """The heat slider while the PID is active (the PID moves it), else None."""
+        heat = self._adapter.heat_slider()
+        if heat is None or not self._adapter.pid_info().get('active'):
+            return None
+        return heat
 
     def _write_lock_error(self) -> web.Response|None:
         """Returns an error response if writes are currently locked. Call with self._lock held."""
@@ -358,6 +369,8 @@ class WebAPI:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             return self._error(400, 'value must be a number')
 
+        if n == self._pid_driven_slider():
+            return self._error(409, f'slider {n} is driven by the active PID; change the SV or switch the PID off')
         self._check_manual_override()
         now = time.monotonic()
         lo, hi = self._adapter.slider_limits(n)
@@ -478,11 +491,23 @@ class WebAPI:
             return self._error(400, 'expected a non-zero shift_temp and/or shift_time')
         if abs(time_s) > MAX_BACKGROUND_TIME_SHIFT:
             return self._error(422, f'shift_time exceeds {MAX_BACKGROUND_TIME_SHIFT}s')
-        if 0 < self._config.max_sv_step < abs(temp):
-            return self._error(422, f'shift_temp {abs(temp)} exceeds max_sv_step {self._config.max_sv_step}')
         bg = self._adapter.background_info()
         if not bg.get('loaded'):
             return self._error(409, 'no background profile loaded and shown')
+        # a move must not make the PID target jump: a time shift can land the lookup point in a very
+        # different part of the curve (e.g. before the background's CHARGE, at charge temperature)
+        limit = self._config.max_sv_step if self._config.max_sv_step > 0 else DEFAULT_MAX_TARGET_JUMP.get(str(bg.get('unit')), 11.0)
+        if abs(temp) > limit:
+            return self._error(422, f'shift_temp {abs(temp)} exceeds the target jump limit {limit}')
+        if time_s:
+            targets = self._adapter.background_targets(time_s)
+            if targets is not None:
+                current, shifted = targets
+                if shifted is None:
+                    return self._error(422, 'shift_time would move the target outside the background profile')
+                if abs(shifted + temp - current) > limit:
+                    return self._error(422, f'shift would move the PID target from {current:.1f} to {shifted + temp:.1f} '
+                                            f'(limit {limit}); use smaller steps')
 
         self._check_manual_override()
         now = time.monotonic()
@@ -752,7 +777,24 @@ class AppAdapter:
             'charged': loaded and qmc.timeindexB[0] > -1,
             'shift_temp': int(qmc.backgroundprofile_moved_y),
             'shift_time': int(qmc.backgroundprofile_moved_x),
+            'unit': str(qmc.mode),
         }
+
+    def background_targets(self, time_s:int) -> tuple[float, float|None]|None:
+        """The background-follow target now and after moving the background time_s later, both at the
+        PID's lookup point (absolute time + lookahead, as PIDcontrol.calcSV). None if not applicable
+        (not recording after CHARGE, or no current target)."""
+        qmc = self.aw.qmc
+        pc = self.aw.pidcontrol
+        if not qmc.flagstart or qmc.timeindex[0] < 0 or not qmc.timex:
+            return None
+        at = qmc.backgroundSmoothedETat if pc.pidSource == 2 else qmc.backgroundSmoothedBTat
+        t = qmc.timex[-1] + pc.svLookahead
+        current = at(t)
+        if current == -1:
+            return None
+        shifted = at(t - time_s) # moving the background later by s shows its value from s earlier
+        return float(current), (None if shifted == -1 else float(shifted))
 
     def shift_background(self, temp:int, time_s:int) -> None:
         sig = self.aw.qmc.moveBackgroundSignal
